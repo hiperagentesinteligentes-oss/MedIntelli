@@ -1,0 +1,203 @@
+🚀 ORIENTAÇÃO OFICIAL
+🧠 Projeto: MedIntelli – Versão Produção
+🏁 Objetivo:
+
+Gerar, configurar e publicar o sistema completo (Sistema Principal + App Paciente + Painel Diagnóstico) em ambiente real de produção, com todas as integrações ativas (Supabase, Avisa API, OpenAI, etc.) e 100% funcionalidade.
+
+🧩 1️⃣ PREPARAÇÃO DO AMBIENTE
+🗂️ Estrutura final do projeto
+
+O projeto deve conter:
+
+src/
+ ├── pages/
+ │    ├── index.tsx
+ │    ├── login.tsx
+ │    ├── dashboard.tsx
+ │    ├── agenda.tsx
+ │    ├── fila-espera.tsx
+ │    ├── pacientes.tsx
+ │    ├── usuarios.tsx
+ │    ├── mensagens-app.tsx
+ │    ├── mensagens-whatsapp.tsx
+ │    ├── feriados.tsx
+ │    ├── dashboard-medico.tsx
+ │    ├── app-paciente/
+ │    │      ├── index.tsx
+ │    │      ├── agendamento.tsx
+ │    │      ├── historico.tsx
+ │    │      ├── chat.tsx
+ │    │      ├── exames.tsx
+ │    │      └── perfil.tsx
+ │    ├── diagnostics-full.tsx   ✅
+ │    └── _app.tsx
+ ├── lib/
+ │    └── supabaseClient.ts
+ ├── styles/
+ │    └── globals.css
+ ├── public/
+ │    ├── favicon.ico
+ │    └── logo.png
+ └── package.json
+
+⚙️ 2️⃣ CONFIGURAÇÃO DO AMBIENTE .env
+
+Crie o arquivo .env.production (ou .env.local se o Minimax usar build direto) com:
+
+VITE_SUPABASE_URL=https://<seu-projeto>.supabase.co
+VITE_SUPABASE_ANON_KEY=<sua_chave_anon>
+VITE_OPENAI_KEY=<sua_chave_openai>
+VITE_AVISA_API_URL=https://api.avisa.app
+VITE_AVISA_API_KEY=<sua_chave_avisa>
+VITE_BUILD_ID=PRODUCAO-<data>-<versao>
+
+
+✅ Verifique que as chaves pertencem à instância real (não Sandbox) do Supabase e Avisa API.
+✅ Verifique se a OpenAI KEY é válida e com billing ativo.
+
+🧱 3️⃣ SUPABASE – CONFIGURAÇÃO DE PRODUÇÃO
+Banco e Edge Functions
+
+Crie um novo projeto no painel do Supabase
+.
+
+Importe o schema final (caso ainda não tenha):
+
+supabase db push
+
+
+ou cole manualmente o SQL fornecido (schema.sql) no SQL Editor.
+
+Implemente as Edge Functions:
+
+supabase functions deploy agendamentos
+supabase functions deploy fila-espera
+supabase functions deploy pacientes
+supabase functions deploy whatsapp-send-message
+supabase functions deploy mensagens-app
+supabase functions deploy mensagens-whatsapp
+supabase functions deploy feriados
+supabase functions deploy base-conhecimento
+supabase functions deploy usuarios
+supabase functions deploy dashboard-medico
+
+
+Ative CORS e autenticação:
+
+Em API Settings, adicione:
+
+Allowed Origins: https://<dominio-final>
+
+
+Em Auth Settings, habilite email/password login.
+
+💬 4️⃣ INTEGRAÇÃO WHATSAPP – AVISA API
+Configuração do Webhook
+
+No painel da Avisa API, configure o endpoint:
+
+https://<dominio-final>/functions/v1/whatsapp-send-message
+
+
+Habilite o webhook de recebimento de mensagens e respostas automáticas.
+
+Teste rápido:
+
+Envie mensagem de teste para o número de WhatsApp configurado.
+
+Verifique se aparece em Painel → Mensagens WhatsApp.
+
+Verifique se o agente de IA responde corretamente (OpenAI ativo).
+
+🧠 5️⃣ OPENAI – BASE DE CONHECIMENTO
+
+Verifique se a tabela knowledge_base contém o arquivo único de conhecimento.
+
+A função base-conhecimento deve buscar os dados da tabela e responder via API OpenAI:
+
+const prompt = "Paciente pergunta: " + mensagem;
+const resposta = await openai.chat.completions.create({
+  model: "gpt-4-turbo",
+  messages: [{ role: "system", content: "Use a base de conhecimento MedIntelli." }, { role: "user", content: prompt }],
+});
+
+
+O diagnóstico /diagnostics-full mostrará 🟢 “Base de Conhecimento OK”.
+
+🌐 6️⃣ BUILD FINAL DE PRODUÇÃO
+
+No Minimax:
+
+Abra o projeto e selecione Build > Ambiente de Produção (Production).
+
+Verifique que o .env.production está sendo usado.
+
+Execute:
+
+npm run build
+npm run start
+
+
+Gere o link final:
+
+https://medintelli.space.minimax.io/
+
+🧭 7️⃣ TESTES DE ACEITAÇÃO FINAL
+Testes automáticos:
+
+Acesse /diagnostics-full → tudo deve estar 🟢
+
+Faça login com cada usuário:
+
+SuperAdmin: acesso total
+
+Médico: vê alertas de novos exames e mensagens
+
+Secretária: consegue agendar e gerenciar fila
+
+Auxiliar: consegue responder mensagens e anexar exames
+
+Testes manuais:
+
+Crie paciente novo (com convênio permitido).
+
+Agende consulta via App Paciente.
+
+Verifique se aparece no Sistema Principal (Agenda).
+
+Envie mensagem via WhatsApp e verifique resposta da IA.
+
+Marque um feriado e veja se aparece na Agenda.
+
+Reordene a fila por arrastar → deve gravar corretamente.
+
+🧾 8️⃣ CHECKLIST FINAL DE ENTREGA
+Item	Status esperado
+✅ Supabase conectado	.env ok e Edge Functions ativas
+✅ OpenAI ativo	IA responde no App Paciente e WhatsApp
+✅ Avisa API conectada	Mensagens enviadas/recebidas
+✅ Agenda	Cria, edita, move e exibe agendamentos
+✅ Fila de espera	Arrasta, edita, converte em agendamento
+✅ Pacientes	CRUD completo e convênios corretos
+✅ Usuários	Cadastro, edição e controle de perfil
+✅ Feriados	Grava, sincroniza e aparece na agenda
+✅ Dashboard Médico	Exibe alertas e contagens corretas
+✅ Diagnóstico Full	Todos os módulos 🟢
+🏁 9️⃣ PÓS-DEPLOY
+
+Adicione no menu SuperAdmin:
+
+Diagnóstico → /diagnostics-full
+
+
+Gere backup completo do banco no Supabase.
+
+Marque versão e data do build no rodapé:
+
+Versão: MedIntelli 1.0 – Build Produção YYYY-MM-DD
+
+
+💡 Em resumo:
+👉 Você deve manter os dois arquivos (diagnostics-full.tsx e diagnostics-fix.json),
+👉 configurar o .env real com as chaves de produção,
+👉 e fazer build fora do Sandbox, com Supabase, OpenAI e Avisa API reais

@@ -1,0 +1,306 @@
+📘 ENTREGA FINAL DEFINITIVA – MEDINTELLI BASIC IA
+
+Versão: 1.0 (Entrega Final de Produção)
+Ambientes:
+
+Sistema Principal → https://62zkzdeuuhvj.space.minimax.io
+
+App Paciente → https://m5etmn33she8.space.minimax.io
+Banco: Supabase
+Mensageria: Avisa API (WhatsApp)
+IA: OpenAI (base local unificada)
+
+🎯 OBJETIVO FINAL
+
+Entregar o sistema completo, 100% funcional, sem erros, conforme a documentação original e o checklist de validação (31 itens), garantindo integração plena entre:
+
+Sistema Principal
+
+App Paciente
+
+WhatsApp (via Avisa API)
+
+IA (com base de conhecimento unificada)
+
+⚙️ ESTRUTURA GERAL DO PROJETO
+Módulo	Função principal	Local
+Sistema Principal	Controle administrativo, agenda, pacientes, fila, feriados, mensagens	/
+App Paciente	Agendamento, histórico, chat IA, envio de exames	/app
+Edge Functions	Lógica back-end (Supabase Functions)	supabase/functions/
+API Routes	Intermediação segura (Next.js)	/pages/api/
+knowledge	Base de conhecimento da IA	/knowledge/base_conhecimento.txt
+🧩 MÓDULOS E FUNCIONALIDADES (definitivas)
+1️⃣ LOGIN e AUTENTICAÇÃO
+
+Utilizar Supabase Auth com persistência local (persistSession: true).
+
+Garantir que o login redirecione corretamente após SIGNED_IN.
+
+Corrigir looping infinito (usar sessionChecked e router.replace('/dashboard')).
+
+Permitir perfis: SuperAdmin, Admin, Auxiliar, Secretaria, Medico.
+
+2️⃣ USUÁRIOS
+
+CRUD completo (listar, criar, editar, inativar).
+
+Permitir alteração de senha e perfil.
+
+Mensagem de sucesso/erro amigável.
+
+3️⃣ PACIENTES
+
+CRUD completo com busca (nome, telefone, convenio).
+
+Cadastro rápido dentro de Agenda e Fila de Espera sem sair da tela.
+
+Campo Convênio deve listar: UNIMED, UNIMED UNIFÁCIL, CASSI, CABESP, PARTICULAR.
+
+Validação obrigatória: Nome e Telefone.
+
+Exibir status (Ativo/Inativo).
+
+4️⃣ AGENDA
+
+Visualização: Dia / Semana / Mês.
+
+Funções:
+
+Criar, Editar, Cancelar.
+
+Reagendar com drag-and-drop.
+
+Mostrar pacientes e não pacientes.
+
+Detectar conflitos e exibir mensagem.
+
+Feriados aparecem bloqueados.
+
+Ocultar horários ocupados no App Paciente.
+
+Sincronizar automaticamente após qualquer modificação.
+
+Permitir registro de observações e tipo de consulta (primeira, retorno, telemedicina etc.).
+
+5️⃣ FILA DE ESPERA
+
+Listar todos os pacientes na fila.
+
+Permitir reordenação (drag-and-drop).
+
+Cadastro rápido (paciente novo ou existente).
+
+Ações:
+
+Adicionar / Remover / Chamar / Converter em agendamento.
+
+Sugestão automática de 3 horários livres.
+
+Exibir status de atendimento.
+
+6️⃣ FERIADOS
+
+Sincronizar nacionais (via OpenAI API).
+
+Criar / Editar / Excluir municipais.
+
+Campo “Recorrente para todos os anos”.
+
+Exibir bloqueio na agenda e no App Paciente.
+
+Corrigir erros “constano” e “POST indefinida”.
+
+Função feriados-sync implementada conforme hotfix v15.
+
+7️⃣ MENSAGENS (PAINEL CENTRAL)
+
+Duas abas: App Paciente e WhatsApp.
+
+Exibir contador de mensagens não lidas.
+
+Exibir nome do paciente (vinculado ao cadastro).
+
+Botão Encaminhar → Dr. Francisco disponível nas duas abas.
+
+Ao encerrar conversa → mover para histórico.
+
+Atualização automática a cada 10 segundos.
+
+Permitir filtrar mensagens por status (lida/não lida/encaminhada).
+
+8️⃣ APP PACIENTE
+
+Login simples com e-mail e senha.
+
+Funcionalidades:
+
+Agendamento (somente horários livres).
+
+Histórico (consultas passadas e futuras).
+
+Chat com IA (responde até concluir atendimento).
+
+Envio de Exames (gera registro no painel principal).
+
+Corrigir bug de fuso (usar America/Sao_Paulo).
+
+Corrigir looping no histórico (usar timeout e abort controller).
+
+Mensagens vazias → exibir “Nenhum item encontrado”.
+
+9️⃣ IA (AGENTE MEDINTELLI)
+
+Base unificada (knowledge/base_conhecimento.txt).
+
+Deve compreender intenções:
+
+Agendar, Cancelar, Reagendar, Enviar Exame, Dúvidas Gerais.
+
+Utilizar gpt-4o-mini com temperature: 0.2.
+
+Função agent-ia deve:
+
+Ler a base local no path configurado.
+
+Gravar o contexto em ia_contextos.
+
+Retornar ação sugerida (para agendamento, cancelamento ou exame).
+
+🔟 INTEGRAÇÃO WHATSAPP (AVISA API)
+Configuração:
+
+AVISA_API_URL e AVISA_API_KEY definidos no .env.
+
+Webhook Receiver:
+
+https://2m72mamv4exw.space.minimax.io/api/whatsapp-webhook
+
+
+Mensagens de teste autorizadas somente para:
++55 16 98870-7777
+
+Edge Functions:
+
+whatsapp-send-message
+
+whatsapp-webhook-receiver
+
+Envio e recebimento registrados na tabela whatsapp_messages.
+
+Fluxo:
+
+Paciente envia mensagem → webhook grava e dispara agent-ia.
+
+Agente responde via whatsapp-send-message.
+
+Mensagem aparece no painel de mensagens do Sistema Principal.
+
+Encaminhamento ao Dr. Francisco disponível.
+
+🧠 VARIÁVEIS .ENV (obrigatórias)
+SUPABASE_URL=
+SUPABASE_ANON_KEY=
+SUPABASE_SERVICE_ROLE_KEY=
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4o-mini
+AVISA_API_URL=
+AVISA_API_KEY=
+WHATSAPP_WEBHOOK_SECRET=
+BASE_KNOWLEDGE_PATH=./knowledge/base_conhecimento.txt
+TZ=America/Sao_Paulo
+
+🧾 VALIDAÇÃO FINAL (Checklist 31 Itens)
+
+Reaplicar integralmente o Manual de Entrega – MedIntelli Basic IA:
+
+Etapa 1 → 23 funcionalidades (Usuários, Pacientes, Feriados, Agenda, Fila).
+
+Etapa 2 → 12 funcionalidades (WhatsApp, App Paciente, IA).
+
+Todos os testes devem ser executados com os usuários abaixo:
+
+Nome	E-mail	Senha	Perfil
+Alencar	alencar@medintelli.com.br
+	senha123	ADMIN
+Silvia	silvia@medintelli.com.br
+	senha123	ADMIN
+Gabriel	gabriel@medintelli.com.br
+	senha123	AUXILIAR
+Natashia	natashia@medintelli.com.br
+	senha123	SECRETARIA
+Dr. Francisco	drfrancisco@medintelli.com.br
+	senha123	MEDICO
+🧪 TESTES AUTOMATIZADOS (Minimax)
+
+Testar CRUD completo de pacientes e agenda.
+
+Validar login simultâneo (usuário + paciente).
+
+Enviar mensagem pelo App Paciente → deve aparecer no painel.
+
+Enviar mensagem WhatsApp → IA deve responder automaticamente.
+
+Criar agendamento → verificar registro no Supabase.
+
+Cancelar consulta → deve atualizar o status.
+
+Enviar exame → deve aparecer para equipe auxiliar.
+
+Validar feriados → bloqueio ativo no App Paciente.
+
+Verificar timeout → nenhuma tela deve travar em loop.
+
+🧱 CONFIGURAÇÕES SUPABASE
+
+Redirect URLs:
+
+https://*.space.minimax.io
+https://2m72mamv4exw.space.minimax.io
+https://m5etmn33she8.space.minimax.io
+http://localhost:3000
+
+
+Site URL:
+https://2m72mamv4exw.space.minimax.io
+
+RLS:
+Desativado em todas as tabelas principais.
+
+Políticas futuras:
+Habilitar somente após validação final.
+
+💡 REQUISITOS DE UI/UX
+
+Layout profissional (tons claros e médicos).
+
+Feedback visual em todas as ações (toasts).
+
+Indicador de carregamento com timeout 15s.
+
+Mensagens de erro sempre legíveis.
+
+Responsividade para desktop e mobile.
+
+Exibir logs “Verificando sessão salva…” apenas em modo debug.
+
+🚀 ENTREGA FINAL (esperada do Minimax)
+
+Resultado esperado:
+
+Login sem loop
+
+CRUD completo e validado
+
+Agenda funcional e sincronizada
+
+Fila de espera operante
+
+Feriados sincronizados
+
+Painel de mensagens ativo (App e WhatsApp)
+
+IA respondendo automaticamente e concluindo atendimento
+
+App Paciente fluido e sem travamentos
+
+Base de conhecimento carregando corretamente

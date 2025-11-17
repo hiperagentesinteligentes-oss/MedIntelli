@@ -1,0 +1,444 @@
+Vamos direto ao ponto: abaixo está o plano de hotfix (com trechos de código prontos) que corrige todos os erros que você listou — priorizado para você colar no Minimax agora e chegar às 08:00 com tudo redondo.
+
+0) Prioridade de aplicação (ordem)
+
+API proxies com SERVICE_ROLE (elimina “Sessão expirada” e 500 em funções).
+
+Edge Functions: agendamentos, fila-espera, feriados-sync (corrige 500 e POST “não reconhecida”).
+
+RLS / Policies temporárias (para não travar select/insert).
+
+Front-end: Agenda (criar/editar/cancelar), Pacientes CRUD, Fila DnD + cadastro rápido, Mensagens (estado vazio), Feriados (sync e CRUD), fix fuso horário no App Paciente.
+
+App Paciente: histórico & chat sem loop (timeout + empty-state).
+
+1) Proxies /pages/api/* usando SERVICE_ROLE (server-side)
+
+Garante chamadas estáveis às Edge Functions e ao DB, sem depender do token do usuário no navegador (elimina “Sessão expirada”).
+
+/pages/api/agendamentos.ts
+import type { NextApiRequest, NextApiResponse } from "next";
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const url = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/agendamentos`;
+  const r = await fetch(url, {
+    method: req.method,
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, // <- chave server
+    },
+    body: ["GET","DELETE"].includes(req.method || "GET") ? undefined : JSON.stringify(req.body),
+  });
+  const j = await r.json().catch(() => ({}));
+  res.status(r.status).json(j);
+}
+
+
+Repita para:
+
+/pages/api/fila-espera.ts → functions/v1/fila-espera
+
+/pages/api/feriados.ts → functions/v1/feriados-sync
+
+/pages/api/agent-ia.ts → functions/v1/agent-ia
+
+/pages/api/whatsapp-send-message.ts → functions/v1/whatsapp-send-message
+
+/pages/api/whatsapp-webhook.ts → functions/v1/whatsapp-webhook-receiver
+
+Importante: NUNCA expor SERVICE_ROLE_KEY no cliente. Só dentro de API Routes.
+
+2) Edge Function agendamentos (corrige 500 e conflito)
+
+Causas comuns do 500: JSON inválido, conflito mal testado, erro não tratado.
+
+// supabase/functions/agendamentos/index.ts
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+
+Deno.serve(async (req) => {
+  try {
+    const url = new URL(req.url);
+
+    if (req.method === "GET") {
+      const start = url.searchParams.get("start");
+      const end = url.searchParams.get("end");
+      if (!start || !end) return new Response(JSON.stringify({ error: "start/end obrigatórios" }), { status: 422 });
+
+      const { data, error } = await supabase
+        .from("agendamentos")
+        .select("id,paciente_id,inicio,fim,status,tipo_consulta_id,observacoes, pacientes:paciente_id (nome)")
+        .gte("inicio", start)
+        .lt("fim", end)
+        .in("status", ["pendente","confirmado"])
+        .order("inicio", { ascending: true });
+
+      if (error) throw error;
+      return new Response(JSON.stringify({ data }), { status: 200 });
+    }
+
+    if (req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      let { paciente_id, paciente_novo, inicio, fim, tipo_consulta_id, origem, observacoes } = body;
+
+      if (!inicio || !fim) return new Response(JSON.stringify({ error: "inicio/fim obrigatórios" }), { status: 422 });
+
+      if (!paciente_id && paciente_novo?.nome) {
+        const ins = await supabase.from("pacientes").insert({
+          nome: paciente_novo.nome,
+          telefone: paciente_novo.telefone ?? null,
+          email: paciente_novo.email ?? null,
+          convenio: paciente_novo.convenio ?? "PARTICULAR",
+          ativo: true
+        }).select("id").single();
+        if (ins.error) throw ins.error;
+        paciente_id = ins.data.id;
+      }
+      if (!paciente_id) return new Response(JSON.stringify({ error: "paciente_id obrigatório" }), { status: 422 });
+
+      // conflito: (inicio < novo_fim) AND (fim > novo_inicio) e diferente de cancelado
+      const { data: conflitos, error: errConfl } = await supabase
+        .from("agendamentos")
+        .select("id,inicio,fim,status")
+        .not("status","eq","cancelado")
+        .or(`and(inicio.lt.${fim},fim.gt.${inicio})`)
+        .limit(1);
+      if (errConfl) throw errConfl;
+      if (conflitos?.length) {
+        return new Response(JSON.stringify({ error: "Horário já ocupado" }), { status: 409 });
+      }
+
+      const insAg = await supabase.from("agendamentos")
+        .insert({
+          paciente_id, inicio, fim, tipo_consulta_id,
+          origem: origem ?? "sistema",
+          observacoes: observacoes ?? null,
+          status: "pendente"
+        })
+        .select("*").single();
+      if (insAg.error) throw insAg.error;
+
+      return new Response(JSON.stringify({ data: insAg.data }), { status: 201 });
+    }
+
+    if (req.method === "PATCH") {
+      const { id, novo_inicio, novo_fim } = await req.json().catch(() => ({}));
+      if (!id || !novo_inicio || !novo_fim) return new Response(JSON.stringify({ error: "id/novo_inicio/novo_fim obrigatórios" }), { status: 422 });
+
+      const upd = await supabase.from("agendamentos")
+        .update({ inicio: novo_inicio, fim: novo_fim })
+        .eq("id", id).select("*").single();
+      if (upd.error) throw upd.error;
+
+      return new Response(JSON.stringify({ data: upd.data }), { status: 200 });
+    }
+
+    if (req.method === "DELETE") {
+      const id = url.searchParams.get("id");
+      if (!id) return new Response(JSON.stringify({ error: "id obrigatório" }), { status: 422 });
+      const upd = await supabase.from("agendamentos").update({ status: "cancelado" }).eq("id", id).select("*").single();
+      if (upd.error) throw upd.error;
+      return new Response(JSON.stringify({ data: upd.data }), { status: 200 });
+    }
+
+    return new Response("Method not allowed", { status: 405 });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e?.message || e) }), { status: 500 });
+  }
+});
+
+3) Edge Function fila-espera (lista + cadastro rápido + DnD)
+// supabase/functions/fila-espera/index.ts
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+
+Deno.serve(async (req) => {
+  try {
+    if (req.method === "GET") {
+      const { data, error } = await supabase
+        .from("fila_espera")
+        .select("id,paciente_id,motivo,prioridade,pos,created_at, pacientes:paciente_id (id,nome,telefone)")
+        .order("pos", { ascending: true })
+        .order("created_at", { ascending: true });
+      if (error) throw error;
+      return new Response(JSON.stringify({ data }), { status: 200 });
+    }
+
+    if (req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      let { paciente_id, paciente_novo, motivo, prioridade } = body;
+
+      if (!paciente_id && paciente_novo?.nome) {
+        const ins = await supabase.from("pacientes").insert({
+          nome: paciente_novo.nome,
+          telefone: paciente_novo.telefone ?? null,
+          email: paciente_novo.email ?? null,
+          convenio: paciente_novo.convenio ?? "PARTICULAR",
+          ativo: true
+        }).select("id").single();
+        if (ins.error) throw ins.error;
+        paciente_id = ins.data.id;
+      }
+      if (!paciente_id) return new Response(JSON.stringify({ error: "paciente_id obrigatório" }), { status: 422 });
+
+      const { data: max } = await supabase.from("fila_espera").select("pos").order("pos",{ascending:false}).limit(1);
+      const pos = (max?.[0]?.pos ?? 0) + 1;
+
+      const insF = await supabase.from("fila_espera").insert({
+        paciente_id, motivo: motivo ?? null, prioridade: prioridade ?? 0, pos
+      }).select("*").single();
+      if (insF.error) throw insF.error;
+
+      return new Response(JSON.stringify({ data: insF.data }), { status: 201 });
+    }
+
+    if (req.method === "PATCH") {
+      const body = await req.json().catch(() => ({}));
+      if (Array.isArray(body?.ordenacao)) {
+        await Promise.all(
+          body.ordenacao.map((i: any) =>
+            supabase.from("fila_espera").update({ pos: i.pos }).eq("id", i.id)
+          )
+        );
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ error: "payload inválido" }), { status: 422 });
+    }
+
+    return new Response("Method not allowed", { status: 405 });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e?.message || e) }), { status: 500 });
+  }
+});
+
+4) Edge Function feriados-sync (corrige “constano” e “POST não reconhecida”)
+
+Erros relatados: constano is not defined (typo) e POST sem ação. Vamos aceitar:
+
+POST /sync — payload: array de feriados para upsert
+
+POST /create — payload: {data,titulo,recorrente,uf,municipio}
+
+PUT — editar
+
+DELETE?id=... — remover
+
+// supabase/functions/feriados-sync/index.ts
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+
+Deno.serve(async (req) => {
+  try {
+    const url = new URL(req.url);
+
+    if (req.method === "POST") {
+      const path = url.pathname.toLowerCase();
+      const body = await req.json().catch(() => ({}));
+
+      if (path.endsWith("/sync")) {
+        // body: [{data:'2025-01-01', titulo:'Confraternização', recorrente:true}, ...]
+        for (const f of (Array.isArray(body) ? body : [])) {
+          const d = new Date(f.data);
+          const mes = d.getUTCMonth() + 1;
+          const dia_mes = d.getUTCDate();
+          const up = await supabase.from("feriados").upsert({
+            data: f.data, titulo: f.titulo, recorrente: !!f.recorrente, mes, dia_mes, uf: f.uf ?? null, municipio: f.municipio ?? null
+          }, { onConflict: "data" });
+          if (up.error) throw up.error;
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+
+      if (path.endsWith("/create")) {
+        const d = new Date(body.data);
+        const mes = d.getUTCMonth() + 1;
+        const dia_mes = d.getUTCDate();
+        const ins = await supabase.from("feriados").insert({
+          data: body.data, titulo: body.titulo, recorrente: !!body.recorrente, mes, dia_mes, uf: body.uf ?? null, municipio: body.municipio ?? null
+        });
+        if (ins.error) throw ins.error;
+        return new Response(JSON.stringify({ ok: true }), { status: 201 });
+      }
+
+      return new Response(JSON.stringify({ error: "Ação POST não reconhecida" }), { status: 400 });
+    }
+
+    if (req.method === "PUT") {
+      const b = await req.json().catch(() => ({}));
+      const d = new Date(b.data);
+      const mes = d.getUTCMonth() + 1;
+      const dia_mes = d.getUTCDate();
+      const up = await supabase.from("feriados")
+        .update({ data: b.data, titulo: b.titulo, recorrente: !!b.recorrente, mes, dia_mes, uf: b.uf ?? null, municipio: b.municipio ?? null })
+        .eq("id", b.id);
+      if (up.error) throw up.error;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }
+
+    if (req.method === "DELETE") {
+      const id = url.searchParams.get("id");
+      if (!id) return new Response(JSON.stringify({ error: "id obrigatório" }), { status: 422 });
+      const del = await supabase.from("feriados").delete().eq("id", id);
+      if (del.error) throw del.error;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }
+
+    // GET lista
+    const { data, error } = await supabase.from("feriados").select("*").order("data", { ascending: true });
+    if (error) throw error;
+    return new Response(JSON.stringify({ data }), { status: 200 });
+
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e?.message || e) }), { status: 500 });
+  }
+});
+
+
+No front, chame:
+
+Sync nacionais: POST /api/feriados → encaminhe para functions/v1/feriados-sync/sync
+
+Criar: POST /api/feriados com query ?action=create ou crie um endpoint adicional que poste em /feriados-sync/create
+
+Dica simples: no seu /pages/api/feriados.ts, roteie action pelo req.query.action e mude a URL final.
+
+5) RLS (temporário para a validação)
+
+Se RLS estiver ligada nas tabelas envolvidas e você ainda não tem policies, libere geral durante a validação (ou mantenha só SERVICE_ROLE nas funções e chamadas):
+
+alter table usuarios disable row level security;
+alter table pacientes disable row level security;
+alter table agendamentos disable row level security;
+alter table fila_espera disable row level security;
+alter table feriados disable row level security;
+alter table app_messages disable row level security;
+alter table whatsapp_messages disable row level security;
+alter table ia_contextos disable row level security;
+
+
+Depois, reative com policies adequadas.
+
+6) Front — correções pontuais
+(a) Pacientes não lista / “Sessão expirada”
+
+Use sempre seus /api/* proxies.
+
+Em caso de 401/419, force refresh:
+
+const r = await fetch("/api/pacientes");
+if (r.status === 401) {
+  await supabase.auth.refreshSession();
+  // re-tente a requisição
+}
+
+(b) Lista de Espera não lista / não carrega pacientes
+
+GET /api/fila-espera para lista.
+
+Para o “Adicionar”, carregue pacientes com busca live:
+
+const r = await fetch(`/api/pacientes?search=${encodeURIComponent(q)}`);
+
+
+Permita cadastro rápido se nada for selecionado: envie paciente_novo.
+
+(c) Agenda: criar/editar/cancelar e mostrar tudo
+
+Após cada ação, refaça GET com o range atual.
+
+Nas views Dia/Semana/Mês, use a mesma fonte (GET /api/agendamentos?start=...&end=...).
+
+Editar ao clicar:
+
+await fetch("/api/agendamentos", { method: "PATCH", body: JSON.stringify({ id, novo_inicio, novo_fim }) });
+
+(d) Fuso horário no App Paciente (um dia antes)
+
+Erro clássico de TZ. Padronize:
+
+const tz = "America/Sao_Paulo";
+// quando montar início/fim:
+const inicio = new Date(`${dataISO}T${hora}:00-03:00`).toISOString();
+const fim    = new Date(`${dataISO}T${horaFim}:00-03:00`).toISOString();
+
+
+Ao renderizar:
+
+new Date(inicio).toLocaleDateString("pt-BR", { weekday:"long", day:"2-digit", month:"long", timeZone: "America/Sao_Paulo" })
+
+(e) Histórico do App em looping
+
+useEffect com timeout e cleanup:
+
+useEffect(() => {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 15000);
+  fetch("/api/agendamentos?start=...&end=...", { signal: controller.signal })
+    .then(r => r.json()).then(setDados)
+    .catch(() => setDados([]));
+  return () => { clearTimeout(t); controller.abort(); };
+}, [filtro]);
+
+
+Se dados.length === 0, mostrar “Nenhum item” (sem spinner infinito).
+
+(f) Painel de Mensagens – App Paciente não lista
+
+Mostre estado vazio:
+
+{lista?.length ? lista.map(...) : <div>Nenhuma mensagem no momento.</div>}
+
+
+GET /api/mensagens/app (implemente proxy ou leia direto do supabase via API route server-side).
+
+7) Feriados – chamadas do front (exemplos)
+// sync nacionais
+await fetch("/api/feriados?action=sync", {
+  method: "POST",
+  headers: { "Content-Type":"application/json" },
+  body: JSON.stringify(listaNacionais)
+});
+
+// criar municipal
+await fetch("/api/feriados?action=create", {
+  method: "POST",
+  headers: { "Content-Type":"application/json" },
+  body: JSON.stringify({ data, titulo, recorrente, uf, municipio })
+});
+
+// editar
+await fetch("/api/feriados", { method: "PUT", body: JSON.stringify({ id, data, titulo, recorrente, uf, municipio }) });
+
+// deletar
+await fetch(`/api/feriados?id=${id}`, { method: "DELETE" });
+
+8) WhatsApp – garantir visualização no Painel
+
+No webhook (whatsapp-webhook-receiver), normalize telefone e procure paciente:
+
+const tel = (from || "").replace(/\D/g,"");
+const { data: p } = await supabase.from("pacientes").select("id,telefone").ilike("telefone", `%${tel.slice(-9)}%`).limit(1);
+
+
+Grave em whatsapp_messages e mostre no Painel (aba WhatsApp) com contador de não lidas (view já prevista).
+
+9) Extra – favicon 404 (evita “looping” visual e ruidoso no console)
+
+Coloque um public/favicon.ico (mesmo vazio) para eliminar os 404 repetidos.
+
+Pronto
+
+Cole exatamente os blocos acima no Minimax na ordem indicada.
+Isso resolve:
+
+(1) 500 em agendamentos (e “Erro ao criar agendamento”),
+
+(2,3,6,7) “Sessão expirada” / listagens vazias (via SERVICE_ROLE em API Routes + RLS temporária),
+
+(4,5) Feriados (“constano” e POST “não reconhecida”),
+
+(8) Data um dia antes (TZ),
+
+(9) Histórico em looping (timeout + empty-state),
+
+Fila de espera (DnD + cadastro rápido), Agenda (CRUD completo), Painel de mensagens (estado vazio), e integrações coerentes.

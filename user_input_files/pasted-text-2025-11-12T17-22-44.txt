@@ -1,0 +1,181 @@
+Perfeito ✅
+Abaixo está o arquivo completo templates_batch.json, reunindo todos os 5 templates oficiais do sistema MedIntelli — prontos para importação direta na AVISA API (ou envio ao suporte técnico).
+
+Esses templates seguem o padrão WhatsApp Business API compatível com a AVISA API, e já incluem o formato de criação em lote.
+Cada mensagem tem identidade visual e tom profissional unificado.
+
+📁 templates_batch.json
+{
+  "templates": [
+    {
+      "name": "alerta_erro_agendamento",
+      "category": "UTILITY",
+      "language": "pt_BR",
+      "components": [
+        {
+          "type": "HEADER",
+          "format": "TEXT",
+          "text": "🩺 Alerta Automático – Sistema MedIntelli"
+        },
+        {
+          "type": "BODY",
+          "text": "⚠️ *{{1}}*\n\n{{2}}\n\n📅 Data/Hora: {{3}}\n\n🔍 Sistema: MedIntelli - Agendamentos\nPor favor, verifique no painel de logs."
+        },
+        {
+          "type": "FOOTER",
+          "text": "💡 Mensagem enviada automaticamente pelo agente de IA."
+        },
+        {
+          "type": "BUTTONS",
+          "buttons": [
+            {
+              "type": "URL",
+              "text": "Abrir Logs",
+              "url": "https://SEU_DOMINIO/dashboard/logs-agendamentos"
+            },
+            {
+              "type": "URL",
+              "text": "Reenviar Confirmação",
+              "url": "https://SEU_DOMINIO/dashboard/agendamentos"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "confirmacao_agendamento",
+      "category": "UTILITY",
+      "language": "pt_BR",
+      "components": [
+        {
+          "type": "HEADER",
+          "format": "TEXT",
+          "text": "📅 Confirmação de Agendamento – Clínica MedIntelli"
+        },
+        {
+          "type": "BODY",
+          "text": "Olá {{1}} 👋\n\nSeu agendamento foi *recebido* para o dia *{{2}}* às *{{3}}*.\n\n📍 Local: Clínica MedIntelli\n🧠 Especialidade: {{4}}\n👩‍⚕️ Profissional: {{5}}\n\nPor favor, confirme sua presença respondendo com *Sim* ou *Não*.\n\nEm caso de dúvidas, entre em contato conosco pelo WhatsApp.\nAgradecemos a confiança!"
+        },
+        {
+          "type": "FOOTER",
+          "text": "💡 Mensagem automática – Sistema Inteligente MedIntelli."
+        },
+        {
+          "type": "BUTTONS",
+          "buttons": [
+            { "type": "QUICK_REPLY", "text": "Confirmar Presença" },
+            { "type": "QUICK_REPLY", "text": "Cancelar Consulta" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "reagendamento_consulta",
+      "category": "UTILITY",
+      "language": "pt_BR",
+      "components": [
+        {
+          "type": "HEADER",
+          "format": "TEXT",
+          "text": "🗓️ Reagendamento de Consulta – Clínica MedIntelli"
+        },
+        {
+          "type": "BODY",
+          "text": "Olá {{1}} 👋\n\nInformamos que sua consulta precisou ser *reagendada*.\n\nO novo horário sugerido é para o dia *{{2}}* às *{{3}}*.\n\n📍 Local: Clínica MedIntelli\n🧠 Especialidade: {{4}}\n👩‍⚕️ Profissional: {{5}}\n\nPor favor, confirme se este novo horário está bom para você respondendo com *Sim* ou *Não*.\n\nAgradecemos sua compreensão e permanecemos à disposição."
+        },
+        {
+          "type": "FOOTER",
+          "text": "💡 Mensagem automática – Sistema Inteligente MedIntelli."
+        },
+        {
+          "type": "BUTTONS",
+          "buttons": [
+            { "type": "QUICK_REPLY", "text": "Confirmar Reagendamento" },
+            { "type": "QUICK_REPLY", "text": "Solicitar Novo Horário" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "cancelamento_consulta",
+      "category": "UTILITY",
+      "language": "pt_BR",
+      "components": [
+        {
+          "type": "HEADER",
+          "format": "TEXT",
+          "text": "❌ Cancelamento de Consulta – Clínica MedIntelli"
+        },
+        {
+          "type": "BODY",
+          "text": "Olá {{1}} 👋\n\nSua consulta marcada para o dia *{{2}}* às *{{3}}* foi *cancelada*.\n\n🧠 Motivo: {{4}}\n\nSe desejar, podemos reagendar para uma nova data.\nBasta responder com *Reagendar* para receber novas opções de horários.\n\nAgradecemos sua compreensão e continuamos à disposição."
+        },
+        {
+          "type": "FOOTER",
+          "text": "💡 Mensagem automática – Sistema Inteligente MedIntelli."
+        },
+        {
+          "type": "BUTTONS",
+          "buttons": [
+            { "type": "QUICK_REPLY", "text": "Reagendar Consulta" },
+            { "type": "URL", "text": "Falar com Atendimento", "url": "https://wa.me/5516988707777" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "lembrete_consulta",
+      "category": "UTILITY",
+      "language": "pt_BR",
+      "components": [
+        {
+          "type": "HEADER",
+          "format": "TEXT",
+          "text": "⏰ Lembrete de Consulta – Clínica MedIntelli"
+        },
+        {
+          "type": "BODY",
+          "text": "Olá {{1}} 👋\n\nLembramos que você tem uma *consulta agendada* para *amanhã*, dia *{{2}}* às *{{3}}*.\n\n📍 Local: Clínica MedIntelli\n🧠 Especialidade: {{4}}\n👩‍⚕️ Profissional: {{5}}\n\nPor favor, confirme sua presença respondendo com *Sim* ou *Não*.\nSe precisar reagendar, responda com *Reagendar*.\n\nAgradecemos sua pontualidade!"
+        },
+        {
+          "type": "FOOTER",
+          "text": "💡 Mensagem automática – Sistema Inteligente MedIntelli."
+        },
+        {
+          "type": "BUTTONS",
+          "buttons": [
+            { "type": "QUICK_REPLY", "text": "Confirmar Presença" },
+            { "type": "QUICK_REPLY", "text": "Cancelar Consulta" },
+            { "type": "QUICK_REPLY", "text": "Reagendar" }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+📦 Como usar
+
+Salvar este conteúdo como:
+templates_batch.json
+
+Importar no painel AVISA API
+→ Seção: WhatsApp > Templates > Importar Lote
+
+Ou enviar via API POST:
+
+POST https://api.avisa.com.br/whatsapp/templates/batch
+Header: Authorization: Bearer <SUA_CHAVE_AVISA_API>
+Content-Type: application/json
+Body: (conteúdo do arquivo acima)
+
+✅ Resultado esperado
+
+Após importação:
+
+Todos os 5 templates ficam disponíveis e aprovados.
+
+A função /agendamentos e o sistema MedIntelli passam a enviar mensagens automáticas com personalização total (nome, data, horário, motivo, profissional).
+
+O fluxo de comunicação estará completo:
+→ Confirmação → Lembrete → Reagendamento → Cancelamento → Alerta interno.

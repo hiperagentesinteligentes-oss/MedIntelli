@@ -1,0 +1,472 @@
+vamos travar um “modo execução sem erro” no MiniMax. Abaixo está um roteiro único para colar no MiniMax (uma tarefa só) que ele deve seguir rigidamente, sem parar, sem mocks, sem dados fictícios, usando apenas o telefone de teste +55 16 98870-7777 durante todo o desenvolvimento automático.
+Inclui: esquema do banco, políticas RLS, endpoints/edge functions, regras do agente de IA com Base Única de Conhecimento, integração WhatsApp (Avisa API), calendário estilo Google, fila de espera, dashboards e seed de usuários com perfis.
+
+Partes de WhatsApp (tabelas, funções, webhooks, centro de mensagens, fluxos de confirmação) referenciam a documentação anexa e devem ser seguidas ao pé da letra. 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+ 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+ 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+ 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+📦 Especificação de Implementação — “SEM ERROS & SEM MOCKS”
+0) Regras Globais (obrigatórias)
+
+Proibir mocks/dados fictícios: qualquer tentativa de enviar mensagem fora do número de teste deve falhar bloqueando a ação com erro visível:
+
+Em DEV/AUTOMÁTICO: SOMENTE +5516988707777.
+
+Em PROD: liberar lista branca via tabela whatsapp_config (chave allowlist_telefones). 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+Botões nunca sem ação:
+
+Antes de renderizar qualquer botão, o MiniMax deve verificar se o handler existe; caso não exista, não renderizar o botão.
+
+Cada botão chama uma função de serviço que bate em uma rota/edge function válida e retorna ok | erro.
+
+Fonte única de verdade para Agendamentos: uma tabela agendamentos abastece Agenda do Sistema Principal e APP Paciente.
+
+Base Única de Conhecimento (BUC): um arquivo corrente, armazenado na tabela knowledge_store (colunas id, version, content, active), lido pelo Agente de IA em todas as decisões/reações (chat, WhatsApp, rotas automáticas).
+
+Timezone: America/Sao_Paulo em todas as consultas/normalizações de data.
+
+Sem parada: MiniMax deve executar toda a fila de tarefas até passar em todos os testes de aceite ao final (lista no item 10).
+
+Observabilidade obrigatória: log estruturado (requestId, rota, payload sanitizado, resultado, tempo) em todas as Edge Functions.
+
+1) Variáveis de Ambiente e Build
+SUPABASE_URL=...
+SUPABASE_ANON_KEY=...
+SUPABASE_SERVICE_ROLE_KEY=...
+
+OPENAI_API_KEY=...
+
+AVISA_API_URL=https://api.avisa.com.br
+AVISA_API_KEY=...
+WHATSAPP_WEBHOOK_SECRET=...
+
+APP_ENV=dev
+TZ=America/Sao_Paulo
+
+
+Regra dev (gating de telefone):
+
+Se APP_ENV=dev, validar que telefone === +5516988707777 antes de qualquer envio WhatsApp; senão 400 com mensagem “Telefone não autorizado em modo DEV”.
+
+2) Banco de Dados (Supabase / Postgres)
+2.1 Tabelas núcleo
+-- Usuários (Auth nativo do Supabase) + Perfil
+create table if not exists user_profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  nome text not null,
+  perfil text not null check (perfil in ('SUPERADMIN','ADMIN','Medico','Secretaria','Auxiliar')),
+  created_at timestamptz default now()
+);
+
+-- Pacientes
+create table if not exists pacientes (
+  id uuid primary key default gen_random_uuid(),
+  nome text not null,
+  data_nascimento date,
+  email text,
+  telefone text,              -- E.164 preferencial
+  telefone_alt text,
+  convenio text,
+  endereco text,
+  contato_nome text,
+  created_at timestamptz default now()
+);
+
+-- Agenda (fonte única)
+create table if not exists agendamentos (
+  id uuid primary key default gen_random_uuid(),
+  paciente_id uuid references pacientes(id),
+  inicio timestamptz not null,
+  fim timestamptz not null,
+  status text not null check (status in ('pendente','confirmado','cancelado','atrasado','em_atendimento')),
+  origem text not null check (origem in ('app','manual','whatsapp','ia')),
+  observacoes text,
+  created_by uuid references auth.users(id),
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+-- Lista de Espera
+create table if not exists fila_espera (
+  id uuid primary key default gen_random_uuid(),
+  paciente_id uuid references pacientes(id),
+  motivo text,
+  prioridade text check (prioridade in ('baixa','media','alta','urgente')) default 'media',
+  status text check (status in ('ativo','atendido','removido')) default 'ativo',
+  created_at timestamptz default now()
+);
+
+-- Feriados (com RLS correta para insert manual)
+create table if not exists feriados (
+  id uuid primary key default gen_random_uuid(),
+  data date not null,
+  titulo text not null,
+  escopo text not null check (escopo in ('nacional','municipal')),
+  municipio text,
+  uf char(2),
+  created_by uuid references auth.users(id),
+  created_at timestamptz default now()
+);
+
+-- WhatsApp (estrutura conforme doc)
+create table if not exists whatsapp_messages (
+  id uuid primary key default gen_random_uuid(),
+  paciente_id uuid references pacientes(id),
+  categoria text not null,    -- agenda/paciente/financeiro/saude/marketing
+  tipo text not null,         -- confirmacao_agendamento, etc.
+  conteudo text not null,
+  template_id text,
+  destinatario_telefone text not null,
+  status_envio text default 'pendente', -- pendente/enviado/entregue/lido/falhou
+  mensagem_origem text default 'sistema', -- sistema/manual/automatica
+  data_agendamento timestamptz,
+  avisa_message_id text,      -- se houver
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists whatsapp_templates (
+  id uuid primary key default gen_random_uuid(),
+  nome text not null,
+  categoria text not null,
+  tipo text not null,
+  conteudo_template text not null,
+  variaveis jsonb,
+  ativo boolean default true,
+  created_at timestamptz default now()
+);
+
+create table if not exists whatsapp_config (
+  id uuid primary key default gen_random_uuid(),
+  chave text unique not null,
+  valor text not null,
+  descricao text,
+  updated_at timestamptz default now()
+);
+
+-- Base Única de Conhecimento
+create table if not exists knowledge_store (
+  id uuid primary key default gen_random_uuid(),
+  version int not null,
+  content text not null,    -- conteúdo inteiro (1 arquivo corrente)
+  active boolean default false,
+  created_at timestamptz default now()
+);
+
+
+As tabelas WhatsApp acima estão alinhadas ao documento técnico anexado e devem ser usadas exatamente (campos/tipos podem ser mantidos como especificados). 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+2.2 RLS
+-- Habilitar RLS nas tabelas de domínio
+alter table user_profiles enable row level security;
+alter table pacientes enable row level security;
+alter table agendamentos enable row level security;
+alter table fila_espera enable row level security;
+alter table feriados enable row level security;
+alter table whatsapp_messages enable row level security;
+alter table whatsapp_templates enable row level security;
+alter table whatsapp_config enable row level security;
+alter table knowledge_store enable row level security;
+
+-- Políticas simples (pode granularizar por tenant se necessário)
+create policy p_select_all_authenticated on pacientes for select to authenticated using (true);
+create policy p_ins_upd_pacientes on pacientes for all to authenticated using (true) with check (true);
+
+create policy p_ag_select on agendamentos for select to authenticated using (true);
+create policy p_ag_insert on agendamentos for insert to authenticated with check (true);
+create policy p_ag_update on agendamentos for update to authenticated using (true) with check (true);
+
+create policy p_fila_select on fila_espera for select to authenticated using (true);
+create policy p_fila_write on fila_espera for insert to authenticated with check (true);
+create policy p_fila_update on fila_espera for update to authenticated using (true) with check (true);
+
+-- Feriados: quem insere deve ser o criador
+create policy feriados_read on feriados for select to authenticated using (true);
+create policy feriados_insert on feriados for insert to authenticated with check (auth.uid() = created_by);
+create policy feriados_update on feriados for update to authenticated using (auth.uid() = created_by) with check (auth.uid() = created_by);
+
+3) Seeds (SUPERADMIN + usuários solicitados)
+
+Criar via Edge Function seed-users usando SERVICE_ROLE para auth.admin.createUser() e depois inserir em user_profiles. Perfis:
+
+SUPERADMIN: tudo liberado
+
+ADMIN
+
+Medico
+
+Secretaria
+
+Auxiliar
+
+Emails e senhas a semear:
+
+Silvia – silvia@medintelli.com.br / senha123 – ADMIN
+
+Gabriel – gabriel@medintelli.com.br / senha123 – Auxiliar
+
+Natashia – natashia@medintelli.com.br / senha123 – Secretaria
+
+Dr. Francisco – drfrancisco@medintelli.com.br / senha123 – Medico
+
+Além disso, crie um SUPERADMIN (seu email) com senha forte.
+
+4) Edge Functions (Supabase)
+4.1 /functions/agendamentos (única fonte de criação/atualização)
+
+POST criar agendamento; valida conflito (inicio ≤ fim, e overlap com outro não cancelado)
+
+PUT atualizar status/reagendar
+
+Em sucesso, dispara:
+
+Realtime para atualizar a UI da Agenda
+
+Automação de confirmação via WhatsApp (se configurado) — ver doc. 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+4.2 /functions/fila-espera
+
+POST inserir na fila
+
+GET listar (status=ativo por padrão)
+
+4.3 /functions/feriados-sync
+
+Buscar feriados automáticos (usar OpenAI/KB para montar lista se necessário) e upsert em feriados (evitar duplicidade).
+
+POST feriados manual: exige created_by = auth.uid() para respeitar RLS.
+
+4.4 WhatsApp (Avisa API) — seguir a doc anexa
+
+whatsapp-send-message: validação de telefone (dev gating), envio via Avisa, registrar em whatsapp_messages e status enviado. 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+whatsapp-webhook-receiver: validar WHATSAPP_WEBHOOK_SECRET, processar event_type/status/contact_phone/message_id, atualizar whatsapp_messages.status_envio, vincular a agendamento_id quando for confirmação. 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+whatsapp-scheduler: lembretes/confirmadores automáticos conforme whatsapp_config. 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+5) API Routes (se usar Next.js API junto das functions)
+
+/api/agendamentos → proxy para functions/agendamentos
+
+/api/fila-espera → proxy para functions/fila-espera
+
+/api/feriados → proxy para functions/feriados-sync
+
+/api/whatsapp-send-message → proxy para functions/whatsapp-send-message
+
+/api/whatsapp-webhook → público (POST) → functions/whatsapp-webhook-receiver
+
+Sempre retornar { ok:true, data } ou { error: 'mensagem' } com HTTP adequado.
+
+6) Base Única de Conhecimento (BUC)
+
+Tabela knowledge_store com 1 registro active=true.
+
+O Agente de IA lê content a cada solicitação (cache local com invalidação por version).
+
+Toda intenção (agendar, cancelar, tirar dúvidas, exames, receituário) primeiro passa no extrator de intenção (OpenAI) alimentado pela BUC, depois chama as rotas reais (/agendamentos, /whatsapp-send-message, etc.).
+
+Proibido responder sem tentar a ação quando intenção exigir (ex.: “quero agendar amanhã”). Se faltar dado (horário, especialidade), o Agente pergunta e finaliza a ação.
+
+7) Frontend — Sistema Principal (link 1)
+7.1 Agenda estilo Google (mensal, semanal, diária)
+
+Modo mensal/semanal: badge com contagem por dia via RPC:
+
+create or replace function public.agenda_contagem_por_dia(_inicio timestamptz, _fim timestamptz)
+returns table(dia date, total bigint)
+language sql stable as $$
+  select (a.inicio at time zone 'America/Sao_Paulo')::date as dia,
+         count(*) as total
+  from agendamentos a
+  where a.inicio >= _inicio and a.inicio < _fim
+    and a.status <> 'cancelado'
+  group by 1
+  order by 1;
+$$;
+
+
+Ao clicar no dia, abrir lista com todos horários e agendamentos (nome do paciente, status, origem, ações rápidas confirmar/cancelar/reagendar).
+
+Realtime: subscrever agendamentos para atualizar imediatamente.
+
+7.2 Fila de Espera
+
+Formulário POST /fila-espera → ao salvar, refetch e renderizar o novo item no topo.
+
+Incluir botão “Voltar” no topo da página.
+
+7.3 Usuários
+
+Criar/Editar obrigatoriamente com feedback visual (loading, success, error). Nunca renderizar botão sem handler atrelado.
+
+7.4 Dashboard de Conversas
+
+Componente WhatsAppMessageCenter (da doc) para listar, filtrar por categoria/tipo/paciente, enviar mensagem (em dev, só número teste). 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+Encaminhar ao médico: botão que marca destino='medico' e cria alerta em “Dashboard Médico”.
+
+7.5 Dashboard Médico (alertas)
+
+Caixas “Novas conversas relevantes” e “Exames recebidos” (ver item 9).
+
+Se médico não responder em X minutos (config em whatsapp_config), alerta visível para Secretaria/Auxiliar “reenviar/lembrar médico”.
+
+8) Frontend — APP Paciente (link 2)
+
+Chat IA (usa BUC) + histórico lá e refletindo no Principal (via rotas únicas).
+
+Agendamento: ao confirmar no chat ou no formulário, chama /agendamentos (POST); resultado atualiza histórico e a Agenda do Principal (Realtime).
+
+Não exibir agendamentos de outras pessoas (scopo por paciente).
+
+9) Fluxos de Automação (resumo obrigatório)
+
+Paciente (WhatsApp ou APP) pede consulta → Classificador (BUC + OpenAI) identifica AGENDA/agendamento_consulta → obtém disponibilidade → confirma horário → POST /agendamentos → envia confirmação via WhatsApp (template) → aparece no APP e no Principal. 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+Cancelamento/Reagendamento idem, acionando PUT /agendamentos com status/novo horário.
+
+Lembretes: whatsapp-scheduler agenda lembretes conforme whatsapp_config (horário/limite diário). 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+Exames: upload no APP/WhatsApp → classificar como SAUDE/resultado_exames → enviar para Dashboard Médico com alerta; se não respondido em N minutos, alerta Secretaria/Auxiliar para intervir.
+
+10) Testes de Aceite (DEV deve passar 100%)
+
+API (vitest/jest/supertest):
+
+Usuários: criar/editar, sem erro de RLS.
+
+Agendamentos: criar (sem conflito), conflito retorna 409, atualizar status, refletir no GET.
+
+Fila de Espera: inserir e listar.
+
+Feriados: buscar automáticos preenche; inserir manual não quebra RLS (com created_by).
+
+WhatsApp:
+
+Envio bloqueia qualquer telefone ≠ +5516988707777 em APP_ENV=dev.
+
+Envio para +5516988707777 grava em whatsapp_messages status_envio='enviado'.
+
+Webhook atualiza status_envio e vincula confirmação ao agendamento. 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+UI (Playwright):
+
+Agenda mensal/semanal mostra contagem por dia; ao clicar, lista horários e mostra o agendamento recém-criado (manual e via APP).
+
+APP Paciente: ao agendar pelo chat, aparece no Principal imediatamente (Realtime).
+
+Fila de Espera: salvar → aparece na lista; botão Voltar funciona.
+
+WhatsApp Dashboard: lista histórico, envia mensagem (dev gating ativo).
+
+Definição de Pronto (DoD): todos os testes acima PASS; nenhuma console error; nenhuma rota 4xx/5xx durante os flows básicos.
+
+11) Passos de Deploy & CI/CD
+# 1) Migrations e RLS
+supabase db push
+
+# 2) Deploy Edge Functions
+supabase functions deploy agendamentos
+supabase functions deploy fila-espera
+supabase functions deploy feriados-sync
+supabase functions deploy whatsapp-send-message
+supabase functions deploy whatsapp-webhook-receiver
+supabase functions deploy whatsapp-scheduler
+# (ver doc) :contentReference[oaicite:14]{index=14}
+
+# 3) Seeds
+supabase functions deploy seed-users
+# chame a seed (ou rode script local) para criar SUPERADMIN e usuários solicitados
+
+
+Pipeline: rodar testes API + UI; se falhar, não publicar.
+
+12) Papéis & Permissões (o que cada um vê)
+
+SUPERADMIN: todas as funções (usuários, perfis, agendamentos, fila, feriados, dashboards, WhatsApp, BUC, configs).
+
+ADMIN: tudo exceto BUC e configs sensíveis.
+
+Medico: Dashboard Médico (conversas relevantes, exames, agenda pessoal), confirmar/cancelar slots; não pode alterar usuários.
+
+Secretaria: agenda completa, fila de espera, feriados, WhatsApp message center, reenvio/alertas ao médico.
+
+Auxiliar: apoio em fila/whatsapp, leitura de agenda, sem acesso a usuários/perfis.
+
+13) UI/UX – Regras de Navegabilidade
+
+Header com links: Agenda, Fila de Espera, Pacientes, Conversas/WhatsApp, Feriados, Usuários (se permitido), Dashboard Médico (se perfil).
+
+Em Fila de Espera, incluir “Voltar” e breadcrumbs.
+
+Em Agenda, uso de cores:
+
+Atrasado (vermelho), Em atendimento (ambar), Confirmado (verde), Pendente (cinza).
+
+Em WhatsApp Dashboard, filtros por categoria/tipo/status, botão “Encaminhar ao Médico”.
+
+Mensagem final para o MiniMax (cole no topo da tarefa)
+
+INSTRUÇÃO OBRIGATÓRIA:
+
+Execute TUDO exatamente como especificado acima, sem parar, sem mocks e usando exclusivamente o telefone +55 16 98870-7777 em APP_ENV=dev.
+
+Não renderize nenhum botão sem handler válido conectado a uma rota/edge function funcional.
+
+Use uma tabela única agendamentos para abastecer Agenda do Principal e APP Paciente.
+
+A Base Única de Conhecimento deve ser 1 arquivo corrente em knowledge_store (active=true) e usada em todas as decisões do Agente de IA.
+
+Integração WhatsApp/Avisa deve seguir o documento anexo (envio, webhook, scheduler, UI de mensagens, templates, categorias/tipos). 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+ 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+ 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+ 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+Publique dois links ao final: Sistema Principal e APP Paciente.
+
+Só finalize quando TODOS os testes de aceite (item 10) estiverem 100% PASS.

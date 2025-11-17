@@ -1,0 +1,431 @@
+1) APP Paciente não faz login (botão sem ação)
+1.1 Página de login (corrige handler)
+
+src/pages/app-paciente/login.tsx
+
+import { useState } from 'react';
+import { supabase } from '@/lib/supabase';
+import { useRouter } from 'next/router';
+
+export default function LoginPaciente(){
+  const [email, setEmail] = useState('');
+  const [senha, setSenha] = useState('');
+  const [loading, setLoading] = useState(false);
+  const r = useRouter();
+
+  async function handleLogin(e: React.FormEvent){
+    e.preventDefault();
+    if (!email || !senha) return alert('Informe e-mail e senha');
+    setLoading(true);
+    const { error } = await supabase.auth.signInWithPassword({ email, password: senha });
+    setLoading(false);
+    if (error) return alert(error.message);
+    r.push('/app-paciente'); // home do app paciente já autenticada
+  }
+
+  return (
+    <div className="p-6 max-w-sm mx-auto space-y-4">
+      <h1 className="text-xl font-semibold">Entrar</h1>
+      <form onSubmit={handleLogin} className="space-y-2">
+        <input className="border p-2 w-full" placeholder="E-mail" value={email} onChange={e=>setEmail(e.target.value)} />
+        <input className="border p-2 w-full" placeholder="Senha" type="password" value={senha} onChange={e=>setSenha(e.target.value)} />
+        <button disabled={loading} className="bg-black text-white px-3 py-2 rounded w-full">
+          {loading ? 'Entrando...' : 'Entrar'}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+1.2 Guard na home do App Paciente
+
+src/pages/app-paciente/index.tsx (substitui topo do arquivo)
+
+import React, { useEffect, useState } from 'react';
+import { supabase } from '@/lib/supabase';
+import Link from 'next/link';
+
+export default function AppPaciente(){
+  const [user, setUser] = useState<any>(null);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data }) => { setUser(data.user); setReady(true); });
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setUser(s?.user ?? null));
+    return () => { sub.subscription.unsubscribe(); };
+  }, []);
+
+  if (!ready) return <p className="p-4">Carregando...</p>;
+  if (!user) return <div className="p-4">Você não está logado. <Link className="text-blue-600 underline" href="/app-paciente/login">Fazer login</Link></div>;
+
+  // ... resto da tela (agendamento/chat)
+  return (<div className="p-4 space-y-3">
+    <h1 className="text-2xl font-semibold">APP Paciente</h1>
+    {/* conteúdo atual que você já tem */}
+  </div>);
+}
+
+2) “Dashboard App Paciente” (central de mensagens/exames)
+
+Criaremos uma tela no Sistema Principal que mostra: conversas do WhatsApp e do App Paciente por paciente, anexos (exames), e permite responder/encaminhar. Usa a estrutura de mensagens/documento já definida. 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+Rotas API (server proxy → edge)
+
+Já existe /api/whatsapp-send-message (envio) e /api/whatsapp-webhook (entrada).
+
+Vamos adicionar uma rota de listagem consolidada:
+
+src/pages/api/painel-paciente.ts
+
+import { SUPABASE_URL, SUPABASE_ANON_KEY } from '@/lib/env';
+export default async function handler(_req:any, res:any){
+  const q = `${process.env.SUPABASE_URL}/rest/v1/whatsapp_messages?select=*,paciente:pacientes(*)&order=created_at.desc`;
+  const r = await fetch(q, { headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` }});
+  const j = await r.json();
+  res.status(200).json({ data: j });
+}
+
+
+Tela do dashboard (no Principal):
+src/pages/pacientes/painel.tsx
+
+import React, { useEffect, useState } from 'react';
+
+export default function PainelPacientes(){
+  const [itens, setItens] = useState<any[]>([]);
+  const [filtro, setFiltro] = useState('');
+
+  async function load(){
+    const r = await fetch('/api/painel-paciente');
+    const j = await r.json();
+    setItens(j.data || []);
+  }
+  useEffect(()=>{ load(); },[]);
+
+  const fil = itens.filter((x)=> (filtro? (x.paciente?.nome||'').toLowerCase().includes(filtro.toLowerCase()) : true));
+
+  return (
+    <div className="p-4 space-y-4">
+      <h1 className="text-2xl font-semibold">Dashboard App Paciente</h1>
+      <input className="border p-2 w-full max-w-md" placeholder="Filtrar por nome do paciente" value={filtro} onChange={e=>setFiltro(e.target.value)} />
+      <div className="grid md:grid-cols-2 gap-3">
+        {fil.map(m => (
+          <div key={m.id} className="border rounded p-3 space-y-1">
+            <div className="text-sm text-gray-500">{new Date(m.created_at).toLocaleString('pt-BR')}</div>
+            <div className="font-medium">{m.paciente?.nome || 'Paciente'}</div>
+            <div className="text-xs text-gray-600">[{m.categoria}/{m.tipo}] → {m.status_envio}</div>
+            <div className="text-sm">{m.conteudo}</div>
+            <div className="flex gap-2 pt-2">
+              <button className="px-2 py-1 border rounded" onClick={()=>alert('Encaminhar ao médico (implementar ação)')}>Encaminhar ao médico</button>
+              <button className="px-2 py-1 border rounded" onClick={()=>alert('Responder (abrir composer)')}>Responder</button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+Se seus exames chegam via upload/chat, salve meta em whatsapp_messages (tipo resultado_exames) e exiba aqui. Categorias/tipos conforme doc. 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+3) Fila de Espera: editar e alterar ordem
+3.1 Adicionar coluna de ordenação e APIs
+
+SQL:
+
+alter table fila_espera add column if not exists pos int generated always as identity; -- simples por ordem de inserção
+
+
+(Se quiser drag-and-drop real, troque para pos int sem identity e controle manual.)
+
+Edge Function (update + reorder)
+supabase/functions/fila-espera/index.ts (substitua bloco PUT e adicione PATCH)
+
+// ...código existente...
+if (req.method === 'PUT') {
+  const { id, motivo, prioridade, status } = await req.json();
+  if (!id) throw new Error('ID ausente');
+  const { data, error } = await supabase.from('fila_espera').update({ motivo, prioridade, status }).eq('id', id).select('*').single();
+  if (error) throw error;
+  return new Response(JSON.stringify({ ok:true, data }), { status:200, headers });
+}
+
+if (req.method === 'PATCH') {
+  const { ordenacao } = await req.json(); // [{id, pos}, ...]
+  if (!Array.isArray(ordenacao)) throw new Error('Payload inválido');
+  for (const o of ordenacao) {
+    await supabase.from('fila_espera').update({ pos: o.pos }).eq('id', o.id);
+  }
+  return new Response(JSON.stringify({ ok:true }), { status:200, headers });
+}
+
+
+Tela com edição e reorder simples
+src/pages/fila-espera/index.tsx (substitua a lista por esta versão)
+
+// ... imports e form iguais ...
+<div className="border rounded p-3">
+  <h3 className="font-medium mb-2">Em espera</h3>
+  <ul className="space-y-1">
+    {items.map((it:any, idx:number)=> (
+      <li key={it.id} className="border p-2 rounded text-sm">
+        <div className="flex justify-between items-center">
+          <div>
+            <div>Paciente: {it.paciente_id} · {it.motivo}</div>
+            <div className="text-gray-500">Prioridade: {it.prioridade} · pos: {it.pos ?? idx}</div>
+          </div>
+          <div className="flex gap-2">
+            <button className="px-2 py-1 border rounded" onClick={async()=>{
+              const motivo = prompt('Novo motivo', it.motivo) ?? it.motivo;
+              const prioridade = prompt('Prioridade (baixa|media|alta|urgente)', it.prioridade) ?? it.prioridade;
+              const r = await fetch('/api/fila-espera', { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: it.id, motivo, prioridade })});
+              if (!r.ok) alert('Falha ao editar'); else load();
+            }}>Editar</button>
+            <button className="px-2 py-1 border rounded" onClick={async()=>{
+              // trocar com item acima
+              if (idx===0) return;
+              const acima = items[idx-1];
+              await fetch('/api/fila-espera', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ ordenacao: [{ id: it.id, pos: (acima.pos ?? idx-1) }, { id: acima.id, pos: (it.pos ?? idx) }] })});
+              await load();
+            }}>▲</button>
+            <button className="px-2 py-1 border rounded" onClick={async()=>{
+              if (idx===items.length-1) return;
+              const abaixo = items[idx+1];
+              await fetch('/api/fila-espera', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ ordenacao: [{ id: it.id, pos: (abaixo.pos ?? idx+1) }, { id: abaixo.id, pos: (it.pos ?? idx) }] })});
+              await load();
+            }}>▼</button>
+          </div>
+        </div>
+      </li>
+    ))}
+  </ul>
+</div>
+
+4) Sistema lento / telas travando
+
+Ajustes rápidos e eficazes:
+
+Paginação e limites nas consultas grandes (WhatsApp/Agenda):
+
+// exemplo: limitar histórico
+const { data } = await supabase
+  .from('whatsapp_messages')
+  .select('*')
+  .order('created_at', { ascending:false })
+  .range(0, 49); // primeiros 50
+
+
+Índices SQL:
+
+create index if not exists idx_agendamentos_inicio on agendamentos(inicio);
+create index if not exists idx_whatsapp_created on whatsapp_messages(created_at desc);
+create index if not exists idx_whatsapp_paciente on whatsapp_messages(paciente_id);
+create index if not exists idx_fila_pos on fila_espera(pos);
+
+
+Skeletons e timeouts no front (mostrar feedback e não travar):
+
+const ctrl = new AbortController();
+setTimeout(()=>ctrl.abort(), 10000);
+await fetch('/api/painel-paciente', { signal: ctrl.signal });
+
+
+useSWR para cache/revalidação opcional e lazy loading de componentes pesados.
+
+5) WhatsApp: mensagens carregadas + mostrar webhook + Agent IA
+5.1 Exibir qual webhook está configurado e status AVISA
+
+Crie uma página de Configurações que puxa e mostra:
+
+src/pages/config/whatsapp.tsx
+
+export default function WhatsConfig(){
+  const base = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
+  const webhook = `${base}/functions/v1/whatsapp-webhook-receiver`;
+
+  return (
+    <div className="p-4 space-y-2">
+      <h1 className="text-2xl font-semibold">WhatsApp / Avisa</h1>
+      <div className="border rounded p-3">
+        <div>Webhook Recebimento (configure na Avisa):</div>
+        <code className="text-sm break-all">{webhook}</code>
+      </div>
+      <div className="border rounded p-3">
+        <div>AVISA_API_URL: {process.env.AVISA_API_URL ? 'definido' : 'não definido'}</div>
+        <div>AVISA_API_KEY: {process.env.AVISA_API_KEY ? 'definido' : 'não definido'}</div>
+        <div>WHATSAPP_WEBHOOK_SECRET: {process.env.WHATSAPP_WEBHOOK_SECRET ? 'definido' : 'não definido'}</div>
+      </div>
+    </div>
+  );
+}
+
+5.2 Carregar mensagens (já entregue no WhatsAppMessageCenter)
+
+Use paginação e filtros. 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+5.3 Agent IA que responde e agenda (WhatsApp e App Paciente)
+
+Crie uma Edge Function que:
+
+Lê a Base Única de Conhecimento (knowledge_store ativo),
+
+Usa OpenAI para classificar intenção e extrair dados,
+
+Se a intenção for agendar/cancelar/reagendar, chama agendamentos,
+
+Retorna a resposta final pronta para enviar.
+
+SQL (garantir tabela BUC)
+
+create table if not exists knowledge_store (
+  id uuid primary key default gen_random_uuid(),
+  version int not null,
+  content text not null,
+  active boolean default false,
+  created_at timestamptz default now()
+);
+
+
+Edge: supabase/functions/agent-ia/index.ts
+
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+Deno.serve(async (req) => {
+  const headers = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type' };
+  if (req.method === 'OPTIONS') return new Response(null, { status:200, headers });
+  const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
+
+  try {
+    const { paciente_id, mensagem } = await req.json();
+    if (!paciente_id || !mensagem) throw new Error('Dados obrigatórios ausentes');
+
+    // 1) BUC
+    const { data: kb } = await supabase.from('knowledge_store').select('content').eq('active', true).order('version', { ascending:false }).limit(1).maybeSingle();
+    const base = kb?.content || '';
+
+    // 2) OpenAI — classificação & extração (substitua por chamada real à API OpenAI)
+    // Aqui você envia: system(base), user(mensagem), e pede JSON: { intent, when, notes }
+    // Para manter exemplo self-contained:
+    let intent = 'informacao';
+    if (/agend|marcar/i.test(mensagem)) intent = 'agendar';
+    if (/cancel/i.test(mensagem)) intent = 'cancelar';
+
+    let resposta = 'Entendi seu pedido. Como posso ajudar?';
+    // 3) Ação
+    if (intent === 'agendar') {
+      // Exemplo: criar para amanhã 10:00-10:30 se não vier horário (demonstração)
+      const start = new Date(); start.setDate(start.getDate()+1); start.setHours(10,0,0,0);
+      const end = new Date(start); end.setMinutes(end.getMinutes()+30);
+      const res = await fetch(`${Deno.env.get('SUPABASE_URL')}/functions/v1/agendamentos`, {
+        method:'POST', headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify({ paciente_id, inicioISO: start.toISOString(), fimISO: end.toISOString(), origem:'ia' })
+      });
+      if (res.ok) resposta = 'Perfeito! Agendei sua consulta. Você receberá a confirmação.';
+      else resposta = 'Estou quase lá. Preciso de um horário específico para concluir seu agendamento. Pode me dizer um horário?';
+    } else if (intent === 'cancelar') {
+      resposta = 'Certo! Envie o dia/horário da consulta para eu cancelar corretamente.';
+    } else {
+      resposta = 'Certo! Vou te ajudar com isso. Se quiser, posso verificar agenda também.';
+    }
+
+    return new Response(JSON.stringify({ ok:true, intent, resposta }), { status:200, headers });
+  } catch (e:any) {
+    return new Response(JSON.stringify({ error: e.message }), { status:400, headers });
+  }
+});
+
+
+Uso no Webhook WhatsApp (responder automaticamente):
+No whatsapp-webhook-receiver, após salvar status, chame o agent:
+
+// depois de atualizar status...
+if (event_type === 'message_received' && contact_phone) {
+  // localizar paciente por telefone (adicione coluna telefone em pacientes)
+  const { data: pac } = await supabase.from('pacientes').select('id').eq('telefone', contact_phone).maybeSingle();
+  if (pac?.id) {
+    const agent = await fetch(`${Deno.env.get('SUPABASE_URL')}/functions/v1/agent-ia`, {
+      method: 'POST', headers: { 'Content-Type':'application/json' },
+      body: JSON.stringify({ paciente_id: pac.id, mensagem: body.text || '' })
+    });
+    const ans = await agent.json();
+    if (ans?.ok && ans.resposta) {
+      await fetch(`${Deno.env.get('SUPABASE_URL')}/functions/v1/whatsapp-send-message`, {
+        method:'POST', headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify({ paciente_id: pac.id, categoria:'agenda', tipo:'resposta_automatica', conteudo: ans.resposta, telefone: contact_phone })
+      });
+    }
+  }
+}
+
+
+O esqueleto respeita sua doc de mensagens/templates e pode evoluir com prompts melhores. 
+
+DOCUMENTACAO_TECNICA_WHATSAPP_A…
+
+6) Página “Base Única de Conhecimento” (editor simples)
+
+src/pages/config/base-conhecimento.tsx
+
+import React, { useEffect, useState } from 'react';
+import { supabase } from '@/lib/supabase';
+
+export default function BUCPage(){
+  const [content, setContent] = useState('');
+  const [version, setVersion] = useState(1);
+
+  async function load(){
+    const { data } = await supabase.from('knowledge_store').select('*').eq('active', true).order('version', { ascending:false }).limit(1);
+    if (data && data.length){ setContent(data[0].content); setVersion(data[0].version); }
+  }
+  useEffect(()=>{ load(); },[]);
+
+  async function save(){
+    const { error } = await supabase.from('knowledge_store').insert({ content, version: version+1, active: true });
+    if (error) return alert(error.message);
+    alert('Base atualizada!');
+  }
+
+  return (
+    <div className="p-4 space-y-3">
+      <h1 className="text-2xl font-semibold">Base Única de Conhecimento</h1>
+      <textarea className="border p-2 w-full h-[60vh]" value={content} onChange={e=>setContent(e.target.value)} />
+      <div className="flex gap-2">
+        <button className="bg-black text-white px-3 py-2 rounded" onClick={save}>Salvar nova versão</button>
+      </div>
+    </div>
+  );
+}
+
+
+Modelo inicial da BUC (cole na primeira versão):
+
+# BASE ÚNICA DE CONHECIMENTO — MEDINTELLI BASIC
+
+- Sempre cumprimente o paciente pelo primeiro nome.
+- Para agendar: confirme data e janela de horário. Duração padrão 30 min.
+- Regras de conflito: nunca marcar sobreposição; sugerir próximo slot livre.
+- Se o paciente pedir cancelamento: exigir data + horário da consulta.
+- Para exames: registrar tipo, data, e anexos; encaminhar ao médico.
+- Horário de atendimento: 08:00–18:00 (seg-sex). Fora desse horário, registrar e responder às 08:00.
+- Políticas de privacidade: não compartilhar dados sensíveis em texto.
+
+7) Check rápido pós-correção
+
+Login App Paciente: /app-paciente/login entra → redireciona para /app-paciente.
+
+Dashboard App Paciente: /pacientes/painel lista conversas/exames, responder/encaminhar.
+
+Fila de Espera: editar motivo/prioridade; setas ▲▼ trocam ordem.
+
+Performance: índices criados; listas paginadas; “Carregando…” com timeout.
+
+WhatsApp: página /config/whatsapp mostra webhook configurado + variáveis de ambiente; histórico carrega paginado; webhook grava e o agent-ia responde e agenda.
+
+BUC: /config/base-conhecimento edita um arquivo único ativo.

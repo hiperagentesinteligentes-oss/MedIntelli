@@ -1,0 +1,249 @@
+🧩 INSTRUÇÃO DEFINITIVA – CORREÇÃO FINAL DO SISTEMA MEDINTELLI BASIC IA
+
+📅 Versão 1.0-Final | Status: Correção estrutural e estabilização backend
+
+⚠️ 1️⃣ RESUMO DOS PROBLEMAS REAIS (AINDA EXISTENTES)
+Módulo	Erro	Causa raiz
+Agenda	500	Edge Function agendamentos quebrada (falha de parâmetro ou relacionamento)
+Pacientes	Sessão expirada	API chamando Supabase diretamente sem proxy + token inválido
+Fila de Espera	500	Edge Function fila-espera sem retorno JSON correto ou conflito em tabela
+Mensagens	404	Tabelas mensagens_app, whatsapp_messages e profissionais inexistentes
+WhatsApp	400 (QR inválido)	Chave Avisa API incorreta ou QR expirando antes de handshake
+Usuários	Sessão expirada ao salvar	API não está usando SERVICE_ROLE_KEY nas rotas Next.js
+🧱 2️⃣ OBJETIVO DESTA ETAPA
+
+Eliminar TODOS os erros de backend (500/400/404) e de sessão expirada, garantindo que todas as Edge Functions, tabelas e APIs estejam 100% sincronizadas.
+
+O sistema já está visualmente completo — o problema agora é estrutural: Supabase + Autenticação + Edge Functions.
+
+🔧 3️⃣ CORREÇÕES OBRIGATÓRIAS (PASSO A PASSO)
+🔹 3.1 – Edge Function agendamentos
+
+Abrir supabase/functions/agendamentos/index.ts e substituir por este código validado:
+
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+Deno.serve(async (req) => {
+  try {
+    const url = new URL(req.url);
+    const method = req.method;
+
+    if (method === "GET") {
+      const start = url.searchParams.get("start");
+      const end = url.searchParams.get("end");
+      if (!start || !end) throw new Error("start e end são obrigatórios.");
+
+      const { data, error } = await supabase
+        .from("agendamentos")
+        .select("id, inicio, fim, status, paciente_id, pacientes (nome)")
+        .gte("inicio", start)
+        .lt("fim", end)
+        .order("inicio", { ascending: true });
+
+      if (error) throw error;
+      return new Response(JSON.stringify({ data }), { status: 200 });
+    }
+
+    if (method === "POST") {
+      const body = await req.json();
+      const { paciente_id, inicio, fim } = body;
+      if (!paciente_id || !inicio || !fim) throw new Error("Campos obrigatórios ausentes.");
+
+      const { data, error } = await supabase
+        .from("agendamentos")
+        .insert(body)
+        .select()
+        .single();
+
+      if (error) throw error;
+      return new Response(JSON.stringify({ data }), { status: 201 });
+    }
+
+    return new Response("Método não suportado", { status: 405 });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: err.message }), { status: 500 });
+  }
+});
+
+
+✅ Correção: tratamento de erro uniforme + parâmetros obrigatórios + retorno JSON válido.
+✅ Resultado esperado: eliminar os 500 em /agendamentos.
+
+🔹 3.2 – Edge Function fila-espera
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+Deno.serve(async (req) => {
+  try {
+    if (req.method === "GET") {
+      const { data, error } = await supabase
+        .from("fila_espera")
+        .select("id, paciente_id, status, pacientes (nome)")
+        .order("created_at", { ascending: true });
+      if (error) throw error;
+      return new Response(JSON.stringify({ data }), { status: 200 });
+    }
+
+    if (req.method === "POST") {
+      const body = await req.json();
+      const { paciente_id } = body;
+      if (!paciente_id) throw new Error("Paciente obrigatório.");
+
+      const { data, error } = await supabase
+        .from("fila_espera")
+        .insert(body)
+        .select()
+        .single();
+      if (error) throw error;
+      return new Response(JSON.stringify({ data }), { status: 201 });
+    }
+
+    return new Response("Método não suportado", { status: 405 });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+  }
+});
+
+
+✅ Correção: corrige os 500 da Fila de Espera.
+
+🔹 3.3 – Recriar tabelas ausentes
+
+Executar no SQL Editor do Supabase:
+
+-- PROFISSIONAIS
+create table if not exists profissionais (
+  id uuid primary key default uuid_generate_v4(),
+  nome text not null,
+  especialidade text,
+  tipo text default 'medico'
+);
+
+-- MENSAGENS_APP
+create table if not exists mensagens_app (
+  id uuid primary key default uuid_generate_v4(),
+  paciente_id uuid references pacientes(id) on delete cascade,
+  conteudo text not null,
+  lida boolean default false,
+  created_at timestamp default now()
+);
+
+-- WHATSAPP_MESSAGES
+create table if not exists whatsapp_messages (
+  id uuid primary key default uuid_generate_v4(),
+  telefone text,
+  mensagem text,
+  lida boolean default false,
+  encaminhamento text,
+  created_at timestamp default now()
+);
+
+
+✅ Corrige os 404 em mensagens_app, whatsapp_messages e profissionais.
+
+🔹 3.4 – Sessão expirada
+
+Ajustar todas as chamadas fetch() do front para irem via /api/ e não diretamente ao Supabase.
+
+No arquivo /pages/api/agendamentos.ts e similares:
+
+export default async function handler(req, res) {
+  const url = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/agendamentos`;
+  const r = await fetch(url, {
+    method: req.method,
+    headers: {
+      "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: ["GET","DELETE"].includes(req.method) ? undefined : JSON.stringify(req.body),
+  });
+  const data = await r.json().catch(() => ({}));
+  res.status(r.status).json(data);
+}
+
+
+✅ Isso elimina o erro “Sessão expirada”.
+
+🔹 3.5 – QR Code Avisa API
+
+Verificar se o token AVISA_API_KEY corresponde ao mesmo número do WhatsApp configurado.
+
+Regenerar QR via painel da Avisa (/instances) e atualizar em .env:
+
+AVISA_INSTANCE_ID=xxxxxxxx
+AVISA_API_KEY=yyyyyyyy
+
+
+Validar o webhook no painel da Avisa:
+
+https://2m72mamv4exw.space.minimax.io/api/whatsapp-webhook
+
+
+Executar um curl:
+
+curl -X GET https://2m72mamv4exw.space.minimax.io/api/whatsapp-status
+
+
+Se o retorno for instance connected: true, o QR está correto.
+
+✅ Corrige QR inválido.
+
+🔹 3.6 – Ajuste geral de políticas Supabase (RLS)
+
+Executar no SQL Editor:
+
+alter table pacientes disable row level security;
+alter table agendamentos disable row level security;
+alter table fila_espera disable row level security;
+alter table mensagens_app disable row level security;
+alter table whatsapp_messages disable row level security;
+alter table profissionais disable row level security;
+
+🧪 4️⃣ TESTES AUTOMÁTICOS PÓS-CORREÇÃO
+
+✅ Acessar /dashboard como Alencar e abrir Agenda → Nenhum erro 500.
+✅ Criar paciente → sem “Sessão expirada”.
+✅ Abrir Fila de Espera → lista carregada.
+✅ Painel de Mensagens → carrega App e WhatsApp sem 404.
+✅ Enviar mensagem → aparece no painel.
+✅ Acessar QR Avisa → status connected: true.
+
+📋 5️⃣ RESULTADO ESPERADO FINAL
+Módulo	Status esperado
+Agenda	✅ Carrega sem 500
+Pacientes	✅ CRUD sem Sessão expirada
+Fila de Espera	✅ Lista e insere normalmente
+Mensagens	✅ Sem 404, carregando dados
+WhatsApp	✅ QR válido e IA respondendo
+Usuários	✅ Salva e atualiza corretamente
+🧠 6️⃣ RECAP .ENV (checar tudo)
+SUPABASE_URL=https://ufxdewolfdpgrxdkvnbr.supabase.co
+SUPABASE_ANON_KEY=
+SUPABASE_SERVICE_ROLE_KEY=
+AVISA_API_KEY=
+AVISA_INSTANCE_ID=
+AVISA_API_URL=https://app.avisa.ai/api
+OPENAI_API_KEY=
+BASE_KNOWLEDGE_PATH=./knowledge/base_conhecimento.txt
+TZ=America/Sao_Paulo
+
+✅ 7️⃣ MENSAGEM FINAL PARA O MINIMAX
+
+Execute todas as correções acima exatamente nessa ordem.
+Valide cada módulo com os logins fornecidos e capture screenshots dos resultados:
+
+Agenda (sem erro 500)
+
+Fila de Espera carregando
+
+Painel de Mensagens com dados
+
+QR Code ativo e IA respondendo via WhatsApp

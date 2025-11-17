@@ -1,0 +1,325 @@
+O pacote já contém as Edge Functions e páginas previstas (ex.: supabase/functions/agendamentos, fila-espera, feriados-sync, agent-ia, APIs em src/pages/api/*.ts, telas medintelli-v1/src/pages/AgendaPage.tsx, FeriadosPage.tsx, e no App Paciente app-paciente-medintelli/src/pages/AgendamentosPage.tsx, hooks/useFeriados.ts, além do AuthContext nos dois apps). Abaixo vai um guia de correções finais + checklist de entrega alinhado ao seu “Manual de Entrega – MedIntelli Basic IA”, com patches pontuais para acabar com os loops, travamentos e garantir que todas as ações funcionem de ponta a ponta (Supabase, OpenAI e WhatsApp/Avisa API).
+
+🔧 Correções críticas que encontrei (e como finalizar)
+1) Looping após login (Sistema Principal)
+
+Sinais: logs “Buscando perfil…” repetindo, tela inicial não finaliza carregamento.
+Causa: o AuthContext reexecuta busca de sessão/perfil em cascata.
+
+Como finalizar (garantido):
+
+No medintelli-v1/src/contexts/AuthContext.tsx, já vi que vocês migraram para getSession(). Certifique que:
+
+o efeito roda uma única vez ([] sem dependências),
+
+router.replace('/login') só ocorre quando loading === false && !user,
+
+a página inicial só renderiza o conteúdo quando loading === false.
+
+Se ainda houver loop, adicione um flag local:
+
+let ativo = true;
+... // setLoading(true) antes de iniciar
+// ao finalizar qualquer ramo, teste `if (ativo) { setLoading(false) }`
+return () => { ativo = false; };
+
+2) Travamento ao agendar no App Paciente
+
+Sinais: agendamento trava / “Erro ao criar agendamento”.
+Causa: paciente_id ausente ou conflito de horário, e o POST não faz “cadastro rápido”.
+
+Como finalizar (na função já existente):
+
+Em supabase/functions/agendamentos/index.ts garanta:
+
+Cadastro rápido quando não houver paciente_id:
+
+if (!paciente_id && paciente_novo?.nome) {
+  const { data: novo, error: e1 } = await supabase
+    .from('pacientes')
+    .insert({
+      nome: paciente_novo.nome,
+      telefone: paciente_novo.telefone,
+      email: paciente_novo.email ?? null,
+      convenio: paciente_novo.convenio ?? 'PARTICULAR',
+      ativo: true
+    })
+    .select('id')
+    .single();
+  if (e1) throw e1;
+  paciente_id = novo.id;
+}
+if (!paciente_id) throw new Error('Informe paciente_id ou paciente_novo');
+
+
+Conflito de horário com filtro correto:
+
+const { data: confl } = await supabase
+  .from('agendamentos')
+  .select('id')
+  .or(`and(inicio.lte.${fimISO},fim.gte.${inicioISO})`)
+  .neq('status','cancelado')
+  .limit(1);
+if (confl?.length) return new Response(JSON.stringify({ error: 'Horário já ocupado' }), { status: 409 });
+
+
+Insert com status: 'pendente' e retorno do id.
+
+No App Paciente (app-paciente-medintelli/src/pages/AgendamentosPage.tsx):
+
+Depois do POST, refetch do histórico e limpar estado.
+
+Mostrar só horários livres (use sua RPC ou select com overlap).
+
+3) Erro ao carregar Feriados (Principal e App)
+
+Sinais: “Erro ao sincronizar feriados” / “looping” / não aparecem na agenda.
+Causas típicas: feriados-sync sem SERVICE_ROLE, RLS impedindo upsert, falta de campos mes/dia_mes/recorrente.
+
+Como finalizar:
+
+Em supabase/functions/feriados-sync/index.ts:
+
+Garanta SUPABASE_SERVICE_ROLE_KEY e createClient com essa key.
+
+No POST (“Sincronizar Automático”):
+
+Upsert calculando mes e dia_mes:
+
+const dia_mes = Number(data.slice(8,10));
+const mes = Number(data.slice(5,7));
+await supabase.from('feriados').upsert({ data, titulo, recorrente, mes, dia_mes }, { onConflict: 'data' });
+
+
+Em medintelli-v1/src/pages/FeriadosPage.tsx:
+
+Trate erros com toast/alert e mostre vazio amigável quando não houver registros.
+
+No calendário (Agenda), destaque:
+
+feriado recorrente quando mes/dia_mes coincidir,
+
+feriado não recorrente quando data for o dia consultado.
+
+4) Lista de Espera não lista/salva
+
+Sinais: GET vazio / POST falha / não sugere paciente novo.
+Como finalizar (a função fila-espera já existe no pacote):
+
+Em supabase/functions/fila-espera/index.ts:
+
+No GET: sempre traga join com paciente e (opcional) agendamento.
+
+const { data } = await supabase
+  .from('fila_espera')
+  .select('*, paciente:pacientes(id,nome,telefone), agendamento:agendamentos(id,inicio,status)')
+  .order('pos', { ascending: true })
+  .order('created_at', { ascending: true });
+
+
+No POST: aceite paciente_id ou paciente_novo (cadastro rápido igual ao de agendamento).
+
+No Front da fila:
+
+Permita arrastar↑↓ (você já tem base DnD): persistir pos via PATCH com array {id, pos}.
+
+Botão AGENDAR a partir da fila: sugerir 3 opções livres e, ao clicar, confirmar (insere em agendamentos, remove da fila).
+
+5) Agenda não mostra itens nas 3 visões
+
+Causa: range de datas incorreto e/ou filtro de status muito restritivo.
+Como finalizar:
+
+Em supabase/functions/agendamentos/index.ts no GET:
+
+Receba scope (day|week|month), start e end (ISO) e use gte('inicio', start).lt('fim', end).
+
+Inclua pendente e confirmado:
+
+.in('status', ['pendente','confirmado'])
+
+
+Em medintelli-v1/src/pages/AgendaPage.tsx:
+
+Adicione input <input type="date"> para mudar o dia base e compute o range do mês/semana/dia.
+
+Após cada operação (criar/cancelar/alterar), faça loadAgenda().
+
+6) Painel de Mensagens (App/WhatsApp)
+
+Sinais: looping “Carregando mensagens…”, sem contagens, sem paciente, sem encaminhar.
+Como finalizar:
+
+Efeito sem dependência circular:
+
+useEffect(()=>{ let alive=true; load(); const id=setInterval(load, 15000);
+  return ()=>{alive=false; clearInterval(id)}; }, []);
+
+
+Dois botões para trocar consulta: App Paciente (tabela app_messages) e WhatsApp (whatsapp_messages).
+
+Mostrar paciente.nome (inclua join no select).
+
+Badges com não lidas (vistas vw_unread_app e vw_unread_whats).
+
+Encaminhar: select com médicos; default = Dr. Francisco; grava encaminhamento e some da “pendente”.
+
+7) Convênios + “PARTICULAR” e Tipos de consulta
+
+Em Pacientes, o select de convênio deve conter:
+
+UNIMED, UNIMED UNIFÁCIL, CASSI, CABESP, PARTICULAR.
+
+Em Agendamento, o select “Tipo de consulta” deve ler de tipos_consulta (já há migrations no pacote).
+
+8) WhatsApp (Avisa API) — restrição de testes
+
+Obrigatório: nas funções whatsapp-webhook-receiver e whatsapp-send-message, valide o número de testes: somente +55 16 988707777 durante os testes automáticos.
+Se vier outro, não envie e logue um aviso (evita envios inadvertidos).
+
+✅ Checklist de Entrega (casado com o seu Manual)
+
+Antes de começar, aplique migrations e garanta .env:
+
+SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, NEXT_PUBLIC_SUPABASE_ANON_KEY
+
+OPENAI_API_KEY, OPENAI_MODEL=gpt-4-turbo
+
+AVISA_API_URL, AVISA_API_KEY
+
+BASE_KNOWLEDGE_PATH=./knowledge/base_conhecimento.txt
+
+1ª Etapa
+(1) Cadastro de Usuários e Perfis
+
+Seed (ou página Usuários) com:
+
+Alencar (ADMIN), Silvia (ADMIN), Gabriel (Auxiliar), Natashia (Secretária), Dr. Francisco (Médico).
+
+Validação: todos entram e veem o que seu perfil permite.
+(Se quiser, incluo uma função seed-users — já existe supabase/functions/seed-users/ no pacote.)
+
+(2) Pacientes
+
+CRUD completo em Pacientes:
+
+cadastrar 20 pacientes,
+
+alterar telefone de 3,
+
+convênio inclui PARTICULAR,
+
+ativar/inativar funciona sem apagar.
+
+(3) Feriados
+
+Cadastrar municipais,
+
+Sincronizar nacionais,
+
+Exibir na Agenda (Principal e App). Dias de feriado aparecem indisponíveis no App.
+
+(4) Agenda – Cadastro Manual
+
+5 agendamentos de pacientes já cadastrados,
+
+3 agendamentos de pacientes não cadastrados (via cadastro rápido do modal),
+
+2 cancelamentos,
+
+2 alterações de data/horário,
+
+Duplo agendamento no mesmo horário entre paciente cadastrado e novo → deve bloquear com 409 “Horário já ocupado”,
+
+Itens aparecem nas visões mês/semana/dia,
+
+App Paciente não lista horários ocupados.
+
+(5) Lista de Espera – Cadastro Manual
+
+5 pacientes novos + 3 cadastrados,
+
+Alterar telefone de 3,
+
+Ordenar por arrastar, e modo “chegada” ou “prioridade”.
+
+2ª Etapa
+(6) Mensagem manual pelo Sistema (WhatsApp/App)
+
+Enviar testando várias situações; IA responde usando Base Única de Conhecimento (arquivo .txt).
+
+Somente número de teste permitido nos automáticos: 16 988707777.
+
+(7) Mensagem simulando Paciente
+
+3 pacientes conversam (App + WhatsApp).
+
+Painel do sistema mostra as conversas, sem loop, com paciente identificado.
+
+(8) Encaminhar para Dr. Francisco
+
+5 encaminhamentos → aparecem como pendentes no médico e, ao finalizar, movem para histórico.
+
+(9) Agendamento via WhatsApp/App
+
+5 agendamentos criados pela IA → Agenda Principal e App mostram os mesmos itens.
+
+🧩 Patches que eu recomendo colar agora (copiar/colar)
+
+Agendamentos (Edge) — cadastro rápido + conflito + range
+(Como acima, dentro do POST e GET de supabase/functions/agendamentos/index.ts)
+
+Fila de Espera (Edge) — GET com joins + POST com paciente_novo
+(Como acima, em supabase/functions/fila-espera/index.ts)
+
+Feriados (Edge) — sincronizar com upsert recorrente
+(Como acima, em supabase/functions/feriados-sync/index.ts)
+
+Painel de Mensagens (Front) — efeito sem loop e “vazio amigável”
+
+useEffect(()=>{
+  let alive=true; const ctrl=new AbortController();
+  async function load(){
+    setLoading(true);
+    try{
+      const r=await fetch(`/api/mensagens?fonte=${fonte}`,{signal:ctrl.signal});
+      const j=await r.json();
+      if(!alive) return; setMensagens(j.data||[]);
+    } finally{
+      if(alive) setLoading(false);
+    }
+  }
+  load(); const id=setInterval(load,15000);
+  return ()=>{alive=false; ctrl.abort(); clearInterval(id);}
+},[fonte]); // fonte = 'app' | 'whatsapp'
+
+
+Agenda (Front) — seletor de data + faixas corretas + refetch após ações
+
+Mês: primeiro/último dia (00:00 → 23:59:59).
+
+Semana: segunda → domingo.
+
+Dia: 00:00 → 23:59:59.
+
+Sempre chamar loadAgenda() após inserir/cancelar/editar.
+
+Auth (Front) — evitar loop
+
+getSession() no AuthContext, uma vez, marcar loading=false sempre (try/finally) e só redirecionar quando !user && !loading.
+
+WhatsApp (Edge) — whitelist de número no teste
+
+const allowed = ['+5516988707777','16988707777','16 988707777'];
+if (!allowed.some(v => telefone.includes(v))) {
+  console.log('Mensagem bloqueada em ambiente de teste', telefone);
+  return ok();
+}
+
+⚠️ Dependências externas (pontos de atenção)
+
+WhatsApp / Avisa API: é indispensável que a URL de webhook pública esteja ativa e as credenciais (AVISA_API_URL, AVISA_API_KEY) estejam corretas. Sem isso, os testes do item 6–9 funcionam só no App; no WhatsApp real dependem do Avisa.
+
+OpenAI: a .env precisa da chave válida, e a Base Única de Conhecimento (./knowledge/base_conhecimento.txt) deve existir e ser legível pelo runtime (Edge que lê via Deno FS ou carregar via Supabase Storage).
+
+RLS: se estiver ativo, as Edge Functions devem usar SERVICE_ROLE para bypass; senão, ajuste policies para permitir inserts/updates esperados.

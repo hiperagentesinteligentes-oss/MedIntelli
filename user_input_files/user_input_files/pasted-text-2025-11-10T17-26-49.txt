@@ -1,0 +1,194 @@
+ORIENTAÇÃO PARA O MINIMAX
+💼 FUNÇÃO: ALTERAR / EDITAR AGENDAMENTO
+🎯 Objetivo
+
+Permitir que o usuário (médico, secretária ou paciente, conforme perfil) clique em um agendamento existente e edite a data, horário e observações — com gravação automática no Supabase e atualização em tempo real na Agenda (Sistema Principal e App Paciente).
+
+⚙️ 1️⃣ Backend — Função agendamentos (Edge Function)
+
+Arquivo: /supabase/functions/agendamentos/index.ts
+
+Adicionar/ajustar o trecho de PUT para suportar a edição completa do agendamento:
+
+if (req.method === 'PUT') {
+  try {
+    const { id, inicioISO, fimISO, status, observacoes } = await req.json();
+    if (!id) throw new Error('ID do agendamento é obrigatório.');
+
+    // Verificar conflito antes de alterar
+    const { data: conflito } = await supabase
+      .from('agendamentos')
+      .select('id')
+      .or(`and(inicio.lte.${fimISO},fim.gte.${inicioISO})`)
+      .neq('id', id)
+      .neq('status', 'cancelado')
+      .limit(1);
+
+    if (conflito && conflito.length > 0) {
+      return new Response(JSON.stringify({ error: 'Horário já ocupado' }), { status: 409 });
+    }
+
+    const { data, error } = await supabase
+      .from('agendamentos')
+      .update({
+        inicio: inicioISO,
+        fim: fimISO,
+        status,
+        observacoes,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', id)
+      .select('*, paciente:pacientes(nome, email)')
+      .single();
+
+    if (error) throw error;
+    return new Response(JSON.stringify({ ok: true, agendamento: data }), { status: 200 });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: e.message }), { status: 400 });
+  }
+}
+
+🧩 2️⃣ API Proxy — /api/agendamentos.ts
+
+Certificar que a API Next encaminha o método PUT corretamente:
+
+if (req.method === 'PUT') {
+  const res = await fetch(`${SUPABASE_FUNCTIONS_URL}/agendamentos`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` },
+    body: JSON.stringify(req.body),
+  });
+  const data = await res.json();
+  return res.status(200).json(data);
+}
+
+🖥️ 3️⃣ Frontend — Sistema Principal (/agenda)
+
+Arquivo: src/pages/agenda/index.tsx
+Adicionar ação ao clicar em um agendamento existente (em qualquer visualização):
+
+function handleClickAgendamento(a) {
+  setSelected(a);
+  setEditModal(true);
+}
+
+
+Criar um Modal de Edição de Agendamento reutilizando o mesmo layout de criação:
+
+<Dialog open={editModal} onClose={()=>setEditModal(false)}>
+  <Dialog.Title>Editar Agendamento</Dialog.Title>
+  <div className="space-y-2 mt-3">
+    <label>Data:</label>
+    <input type="date" value={data} onChange={e=>setData(e.target.value)} className="border p-1 rounded w-full"/>
+    <label>Horário:</label>
+    <input type="time" value={hora} onChange={e=>setHora(e.target.value)} className="border p-1 rounded w-full"/>
+    <label>Observações:</label>
+    <textarea value={obs} onChange={e=>setObs(e.target.value)} className="border p-1 rounded w-full"/>
+  </div>
+  <div className="flex justify-end mt-4 gap-2">
+    <button onClick={()=>setEditModal(false)} className="px-3 py-1 border rounded">Cancelar</button>
+    <button onClick={handleSalvarAlteracao} className="px-3 py-1 bg-indigo-600 text-white rounded">Salvar</button>
+  </div>
+</Dialog>
+
+
+Função de salvar a alteração:
+
+async function handleSalvarAlteracao() {
+  const inicioISO = new Date(`${data}T${hora}:00`).toISOString();
+  const fimISO = new Date(`${data}T${hora}:00`).setMinutes(new Date(`${data}T${hora}:00`).getMinutes() + 30);
+
+  const res = await fetch('/api/agendamentos', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id: selected.id,
+      inicioISO,
+      fimISO: new Date(fimISO).toISOString(),
+      status: selected.status,
+      observacoes: obs,
+    }),
+  });
+
+  const j = await res.json();
+  if (j.ok) {
+    alert('Agendamento atualizado com sucesso!');
+    setEditModal(false);
+    loadAgenda();
+  } else {
+    alert('Erro ao atualizar: ' + j.error);
+  }
+}
+
+📱 4️⃣ Frontend — APP Paciente
+
+Arquivo: src/pages/app-paciente/Historico.tsx
+Permitir que o paciente altere data e horário, somente se status = “pendente”:
+
+{item.status === 'pendente' && (
+  <button
+    onClick={() => {
+      const novaData = prompt('Nova data (AAAA-MM-DD):', item.inicio.slice(0,10));
+      const novaHora = prompt('Novo horário (HH:MM):', new Date(item.inicio).toLocaleTimeString().slice(0,5));
+      if (!novaData || !novaHora) return;
+      alterarAgendamento(item.id, novaData, novaHora);
+    }}
+    className="text-indigo-600 text-sm underline"
+  >
+    Alterar
+  </button>
+)}
+
+
+E a função:
+
+async function alterarAgendamento(id, novaData, novaHora) {
+  const inicioISO = new Date(`${novaData}T${novaHora}:00`).toISOString();
+  const fimISO = new Date(`${novaData}T${novaHora}:00`);
+  fimISO.setMinutes(fimISO.getMinutes() + 30);
+
+  const res = await fetch('/api/agendamentos', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id,
+      inicioISO,
+      fimISO: fimISO.toISOString(),
+      status: 'pendente',
+      observacoes: 'Reagendado pelo paciente via App',
+    }),
+  });
+
+  const j = await res.json();
+  if (j.ok) {
+    alert('Agendamento alterado com sucesso!');
+    carregarHistorico();
+  } else {
+    alert('Erro ao alterar: ' + j.error);
+  }
+}
+
+🔄 5️⃣ Sincronização Realtime (opcional)
+
+O canal Realtime já existente deve ouvir alterações (UPDATE) na tabela agendamentos e atualizar a Agenda automaticamente:
+
+useEffect(() => {
+  const channel = supabase
+    .channel('agendamentos_realtime')
+    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'agendamentos' }, payload => {
+      console.log('Agendamento atualizado:', payload);
+      loadAgenda();
+    })
+    .subscribe();
+  return () => supabase.removeChannel(channel);
+}, []);
+
+✅ Resultado esperado
+
+Clique em um agendamento → abre modal de edição.
+
+Alteração salva → atualiza no banco e reflete no histórico e agenda.
+
+Paciente pode reagendar, mas não alterar agendamentos confirmados.
+
+Supabase Realtime mantém tudo sincronizado.

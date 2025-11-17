@@ -1,0 +1,110 @@
+=== BASE DE CONHECIMENTO MEDINTELLI ===
+
+HORARIOS DE FUNCIONAMENTO:
+- Segunda a Sexta: 08:00 as 18:00
+- Sabados: 08:00 as 12:00
+- Domingos: Fechado
+
+TIPOS DE CONSULTA:
+- Consulta Medica (45 min)
+- Retorno (30 min)
+- Procedimentos (60 min)
+- Telemedicina (30 min)
+- Urgencia (15 min)
+
+CONVENIOS ATENDIDOS:
+- UNIMED
+- UNIMED UNIFACIL
+- CASSI
+- CABESP
+- PARTICULAR
+
+POLITICAS:
+- Cancelamento com 24h de antecedencia
+- Exames devem ser enviados 24h antes
+- Agendamentos via WhatsApp ate 18h
+- Primeira consulta: chegar 15min antes
+
+REGRAS DE AGENDA:
+- Horarios livre entre 9h-17h (seg-sex)
+- Sabados apenas 9h-11h
+- Dr. Francisco disponivel: seg, ter, qui, sex
+- Fila de espera: prioridade por ordem
+- Emergencias: sem agendamento
+
+ESPECIALIDADES MEDICAS:
+- Cardiologia (Dr. Ricardo Mendes)
+- Dermatologia (Dra. Marina Silva)
+- Endocrinologia (Dr. Carlos Roberto)
+- Gastroenterologia (Dra. Ana Lucia)
+- Ginecologia (Dra. Fernanda Costa)
+- Neurologia (Dr. Pedro Santos)
+- Oftalmologia (Dra. Roberta Lima)
+- Ortopedia (Dr. Joao Oliveira)
+- Pediatria (Dra. Sandra Meyer)
+- Psiquiatria (Dr. Miguel Rodrigues)
+- Urologia (Dr. Paulo Henrique)
+
+SINTOMAS E ORIENTACOES:
+- Febre: Consulta se acima de 38.5C por mais de 48h
+- Dor de cabeca: Avaliar intensidade e frequencia
+- Dor no peito: Sempre priorizar avaliacao cardiologica urgente
+- Falta de ar: Buscar atendimento imediato
+- Dor abdominal: Avaliar localizacao e intensidade
+
+PROTOCOLOS DE EMERGENCIA:
+Sinais que requerem atencao IMEDIATA:
+- Dor no peito intensa
+- Dificuldade respiratoria severa
+- Perda subita de consciencia
+- Sangramento intenso
+- Vomitos com sangue
+- Sinais de AVC (paralisia, dificuldade para falar)
+- Febre muito alta (acima de 40C)
+
+INTENCOES SUPORTADAS:
+1. AGENDAR_CONSULTA
+   - Detectar: "quero agendar", "marcar consulta", "preciso consultar"
+   - Acao: Verificar horarios disponiveis e criar agendamento
+
+2. CANCELAR_CONSULTA
+   - Detectar: "cancelar consulta", "desmarcar", "nao posso ir"
+   - Acao: Cancelar agendamento existente
+
+3. REAGENDAR_CONSULTA
+   - Detectar: "remarcar", "mudar horario", "trocar data"
+   - Acao: Cancelar e criar novo agendamento
+
+4. ENVIAR_EXAME
+   - Detectar: "enviar exame", "anexar resultado", "tenho exame"
+   - Acao: Registrar no painel para equipe auxiliar
+
+5. DUVIDAS_GERAIS
+   - Detectar: perguntas sobre horarios, convenios, procedimentos
+   - Acao: Fornecer informacoes da base de conhecimento
+
+ORIENTACOES PARA IA:
+- Usar linguagem clara e empatica
+- Confirmar dados antes de executar acoes
+- Sempre mencionar politicas relevantes
+- Priorizar seguranca do paciente
+- Direcionar emergencias para atendimento presencial
+
+CONVERSAO DE SINTOMAS EM ACOES:
+- Sintomas leves: Agendar consulta de rotina
+- Sintomas moderados: Agendar consulta prioritaria
+- Sintomas graves: Direcionar para emergencia
+- Sintomas especificos: Orientar especialista adequado
+
+DOCUMENTOS NECESSARIOS:
+- RG ou CNH
+- CPF
+- Cartao do convenio (se aplicavel)
+- Exames anteriores relevantes
+
+ORIENTACOES PARA PACIENTES:
+1. Chegar 15 minutos antes do horario
+2. Jejum de 12h para exames de sangue
+3. Suspender medicamentos apenas com orientacao medica
+4. Informar alergias e medicamentos em uso
+5. Resultados disponiveis em 48-72h

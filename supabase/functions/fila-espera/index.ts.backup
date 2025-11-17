@@ -1,0 +1,341 @@
+Deno.serve(async (req) => {
+    const corsHeaders = {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+        'Access-Control-Allow-Methods': 'POST, GET, OPTIONS, PUT, DELETE, PATCH',
+        'Access-Control-Max-Age': '86400',
+        'Access-Control-Allow-Credentials': 'false'
+    };
+
+    if (req.method === 'OPTIONS') {
+        return new Response(null, { status: 200, headers: corsHeaders });
+    }
+
+    try {
+        const supabaseUrl = Deno.env.get('SUPABASE_URL');
+        const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+
+        if (!supabaseUrl || !serviceRoleKey) {
+            throw new Error('Supabase configuration missing');
+        }
+
+        const requestId = crypto.randomUUID();
+        const startTime = Date.now();
+
+        // Log estruturado
+        console.log(JSON.stringify({
+            requestId,
+            method: req.method,
+            url: req.url,
+            timestamp: new Date().toISOString()
+        }));
+
+        // Get user from auth header
+        const authHeader = req.headers.get('authorization');
+        if (!authHeader) {
+            throw new Error('No authorization header');
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+
+        // Verify token and get user
+        const userResponse = await fetch(`${supabaseUrl}/auth/v1/user`, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'apikey': serviceRoleKey
+            }
+        });
+
+        if (!userResponse.ok) {
+            throw new Error('Invalid token');
+        }
+
+        const userData = await userResponse.json();
+        const userId = userData.id;
+
+        if (req.method === 'GET') {
+            // Listar fila de espera
+            const url = new URL(req.url);
+            const status = url.searchParams.get('status') || 'ativo';
+
+            let query = `${supabaseUrl}/rest/v1/fila_espera?status=eq.${status}&order=created_at.asc`;
+
+            const response = await fetch(query, {
+                headers: {
+                    'Authorization': `Bearer ${serviceRoleKey}`,
+                    'apikey': serviceRoleKey,
+                    'Content-Type': 'application/json'
+                }
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`Failed to fetch waiting list: ${errorText}`);
+            }
+
+            const fila = await response.json();
+
+            console.log(JSON.stringify({
+                requestId,
+                action: 'list',
+                status,
+                count: fila.length,
+                duration: Date.now() - startTime
+            }));
+
+            return new Response(JSON.stringify({ data: fila }), {
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+
+        } else if (req.method === 'POST') {
+            // Inserir na fila de espera
+            const { 
+                paciente_id, 
+                nome_paciente, 
+                telefone, 
+                tipo_consulta, 
+                urgencia_detectada = 'media', 
+                condicao_medica, 
+                observacoes 
+            } = await req.json();
+
+            if (!nome_paciente || !telefone || !tipo_consulta) {
+                throw new Error('nome_paciente, telefone and tipo_consulta are required');
+            }
+
+            // Calcular score de prioridade
+            let score = 0;
+            switch (urgencia_detectada) {
+                case 'urgente': score = 100; break;
+                case 'alta': score = 75; break;
+                case 'media': score = 50; break;
+                case 'baixa': score = 25; break;
+            }
+
+            // Obter posição atual
+            const positionResponse = await fetch(
+                `${supabaseUrl}/rest/v1/fila_espera?status=eq.aguardando&select=posicao_atual&order=posicao_atual.desc&limit=1`,
+                {
+                    headers: {
+                        'Authorization': `Bearer ${serviceRoleKey}`,
+                        'apikey': serviceRoleKey
+                    }
+                }
+            );
+
+            const positions = await positionResponse.json();
+            const nextPosition = positions.length > 0 ? positions[0].posicao_atual + 1 : 1;
+
+            const filaItem = {
+                paciente_id,
+                nome_paciente,
+                telefone,
+                tipo_consulta,
+                urgencia_detectada,
+                condicao_medica,
+                observacoes,
+                status: 'aguardando',
+                origem_cadastro: 'manual',
+                posicao_original: nextPosition,
+                posicao_atual: nextPosition,
+                score_prioridade: score,
+                analista_user_id: userId
+            };
+
+            const createResponse = await fetch(`${supabaseUrl}/rest/v1/fila_espera`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${serviceRoleKey}`,
+                    'apikey': serviceRoleKey,
+                    'Content-Type': 'application/json',
+                    'Prefer': 'return=representation'
+                },
+                body: JSON.stringify(filaItem)
+            });
+
+            if (!createResponse.ok) {
+                const errorText = await createResponse.text();
+                throw new Error(`Failed to create waiting list item: ${errorText}`);
+            }
+
+            const createdItem = await createResponse.json();
+
+            console.log(JSON.stringify({
+                requestId,
+                action: 'create',
+                itemId: createdItem[0].id,
+                position: nextPosition,
+                score: score,
+                duration: Date.now() - startTime
+            }));
+
+            return new Response(JSON.stringify({ data: createdItem[0] }), {
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+
+        } else if (req.method === 'PUT') {
+            // Atualizar posição de item da fila (reordenação)
+            const { id, nova_posicao } = await req.json();
+
+            if (!id || nova_posicao === undefined) {
+                throw new Error('Item ID and nova_posicao are required for reordering');
+            }
+
+            // Buscar item atual
+            const currentResponse = await fetch(`${supabaseUrl}/rest/v1/fila_espera?id=eq.${id}&select=*`, {
+                headers: {
+                    'Authorization': `Bearer ${serviceRoleKey}`,
+                    'apikey': serviceRoleKey
+                }
+            });
+
+            const currentItems = await currentResponse.json();
+            if (currentItems.length === 0) {
+                throw new Error('Item not found');
+            }
+
+            const currentItem = currentItems[0];
+            const oldPosition = currentItem.posicao_atual;
+
+            // Atualizar posições de outros itens
+            if (nova_posicao > oldPosition) {
+                // Movendo para baixo: decrementar posições entre old e new
+                await fetch(`${supabaseUrl}/rest/v1/fila_espera?posicao_atual=gte.${oldPosition}&posicao_atual=lte.${nova_posicao}&status=eq.aguardando`, {
+                    method: 'PATCH',
+                    headers: {
+                        'Authorization': `Bearer ${serviceRoleKey}`,
+                        'apikey': serviceRoleKey,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        posicao_atual: `posicao_atual - 1`,
+                        data_ultima_atualizacao: new Date().toISOString()
+                    })
+                });
+            } else if (nova_posicao < oldPosition) {
+                // Movendo para cima: incrementar posições entre new e old
+                await fetch(`${supabaseUrl}/rest/v1/fila_espera?posicao_atual=gte.${nova_posicao}&posicao_atual=lt.${oldPosition}&status=eq.aguardando`, {
+                    method: 'PATCH',
+                    headers: {
+                        'Authorization': `Bearer ${serviceRoleKey}`,
+                        'apikey': serviceRoleKey,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        posicao_atual: `posicao_atual + 1`,
+                        data_ultima_atualizacao: new Date().toISOString()
+                    })
+                });
+            }
+
+            // Atualizar posição do item
+            const updateResponse = await fetch(`${supabaseUrl}/rest/v1/fila_espera?id=eq.${id}`, {
+                method: 'PATCH',
+                headers: {
+                    'Authorization': `Bearer ${serviceRoleKey}`,
+                    'apikey': serviceRoleKey,
+                    'Content-Type': 'application/json',
+                    'Prefer': 'return=representation'
+                },
+                body: JSON.stringify({
+                    posicao_atual: nova_posicao,
+                    data_ultima_atualizacao: new Date().toISOString()
+                })
+            });
+
+            if (!updateResponse.ok) {
+                const errorText = await updateResponse.text();
+                throw new Error(`Failed to reorder item: ${errorText}`);
+            }
+
+            const updatedItem = await updateResponse.json();
+
+            console.log(JSON.stringify({
+                requestId,
+                action: 'reorder',
+                itemId: id,
+                oldPosition,
+                newPosition: nova_posicao,
+                duration: Date.now() - startTime
+            }));
+
+            return new Response(JSON.stringify({ data: updatedItem[0] }), {
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+
+        } else if (req.method === 'PATCH') {
+            // Editar dados de item da fila (sem reordenação)
+            const { id, urgencia_detectada, condicao_medica, observacoes, tipo_consulta } = await req.json();
+
+            if (!id) {
+                throw new Error('Item ID is required for update');
+            }
+
+            const updateData: any = {
+                updated_at: new Date().toISOString(),
+                data_ultima_atualizacao: new Date().toISOString()
+            };
+
+            if (urgencia_detectada) {
+                updateData.urgencia_detectada = urgencia_detectada;
+                // Recalcular score
+                switch (urgencia_detectada) {
+                    case 'urgente': updateData.score_prioridade = 100; break;
+                    case 'alta': updateData.score_prioridade = 75; break;
+                    case 'media': updateData.score_prioridade = 50; break;
+                    case 'baixa': updateData.score_prioridade = 25; break;
+                }
+            }
+            if (condicao_medica !== undefined) updateData.condicao_medica = condicao_medica;
+            if (observacoes !== undefined) updateData.observacoes = observacoes;
+            if (tipo_consulta !== undefined) updateData.tipo_consulta = tipo_consulta;
+
+            const updateResponse = await fetch(`${supabaseUrl}/rest/v1/fila_espera?id=eq.${id}`, {
+                method: 'PATCH',
+                headers: {
+                    'Authorization': `Bearer ${serviceRoleKey}`,
+                    'apikey': serviceRoleKey,
+                    'Content-Type': 'application/json',
+                    'Prefer': 'return=representation'
+                },
+                body: JSON.stringify(updateData)
+            });
+
+            if (!updateResponse.ok) {
+                const errorText = await updateResponse.text();
+                throw new Error(`Failed to update item: ${errorText}`);
+            }
+
+            const updatedItem = await updateResponse.json();
+
+            console.log(JSON.stringify({
+                requestId,
+                action: 'edit',
+                itemId: id,
+                changes: Object.keys(updateData),
+                duration: Date.now() - startTime
+            }));
+
+            return new Response(JSON.stringify({ data: updatedItem[0] }), {
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        throw new Error(`Method ${req.method} not allowed`);
+
+    } catch (error) {
+        console.error('Waiting list function error:', error);
+
+        const errorResponse = {
+            error: {
+                code: 'WAITING_LIST_ERROR',
+                message: error.message
+            }
+        };
+
+        return new Response(JSON.stringify(errorResponse), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+});

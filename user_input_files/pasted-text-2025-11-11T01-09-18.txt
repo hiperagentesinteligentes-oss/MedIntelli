@@ -1,0 +1,319 @@
+Segue o Patch Pack v4 (cirúrgico e direto) para o MiniMax aplicar e zerar os 17 pontos que você listou. Copie e cole por seções (SQL → Edge Functions → API → Front → App Paciente).
+
+Ordem de aplicação: SQL → RLS → Edge Functions → /api → Front. Reinicie o servidor ao final.
+
+0) SQL – ajustes de schema & índices
+0.1 Agendamentos exibirem corretamente (índices + status)
+create index if not exists idx_agend_inicio    on agendamentos(inicio);
+create index if not exists idx_agend_status    on agendamentos(status);
+create index if not exists idx_agend_paciente  on agendamentos(paciente_id);
+
+0.2 Pacientes (convênio “PARTICULAR” + campo tipo_consulta)
+alter table pacientes
+  add column if not exists convenio text
+    check (convenio in ('UNIMED','UNIMED UNIFÁCIL','CASSI','CABESP','PARTICULAR'));
+
+create table if not exists tipos_consulta (
+  id uuid primary key default gen_random_uuid(),
+  nome text unique not null
+);
+
+insert into tipos_consulta (nome)
+  values ('Primeira consulta'), ('Retorno'), ('Urgente'), ('Telemedicina')
+on conflict (nome) do nothing;
+
+0.3 Fila de espera (listar/salvar/ordenar)
+alter table fila_espera add column if not exists pos int;
+create index if not exists idx_fila_created on fila_espera(created_at);
+create index if not exists idx_fila_pos     on fila_espera(pos);
+
+0.4 Feriados (CRUD + recorrência)
+alter table feriados
+  add column if not exists recorrente boolean default false,
+  add column if not exists dia_mes int,
+  add column if not exists mes int;
+
+update feriados
+  set dia_mes = extract(day from data), mes = extract(month from data)
+where dia_mes is null or mes is null;
+
+0.5 Visões auxiliares (contadores de não lidas)
+create view vw_unread_app as
+select paciente_id, count(*) as nao_lidas
+from app_messages
+where lida = false
+group by paciente_id;
+
+create view vw_unread_whats as
+select paciente_id, count(*) as nao_lidas
+from whatsapp_messages
+where status_envio in ('enviado','entregue') and coalesce(lida,false)=false
+group by paciente_id;
+
+1) RLS (se estiver ativo) – evitar “Erro ao criar/salvar”
+
+Se RLS ativo, garanta:
+
+-- exemplo base: permitir a usuários autenticados ler e criar seus registros
+alter policy if exists sel_agend on agendamentos using (true);
+alter policy if exists ins_agend on agendamentos
+  with check (true);
+
+alter policy if exists sel_fila on fila_espera using (true);
+alter policy if exists ins_fila on fila_espera with check (true);
+
+-- OU, se as Edge Functions usam SERVICE_ROLE, elas já bypassam RLS.
+
+2) Edge Functions – correções funcionais
+2.1 /supabase/functions/agendamentos/index.ts
+
+Corrige “Erro ao criar agendamento”.
+
+GET por dia/semana/mês.
+
+Cadastro rápido de paciente, quando não estiver cadastrado.
+
+Inclui status IN (pendente,confirmado) por padrão (problema 1 e 2; 3 – quick add).
+
+// pseudo-impl. pontos críticos
+if (req.method === 'GET') {
+  const url = new URL(req.url);
+  const scope = url.searchParams.get('scope'); // 'day'|'week'|'month'
+  const start = url.searchParams.get('start'); // ISO
+  const end   = url.searchParams.get('end');   // ISO
+
+  const { data, error } = await supabase
+    .from('agendamentos')
+    .select('*, paciente:pacientes(id,nome,telefone,convenio)')
+    .gte('inicio', start).lt('fim', end)
+    .in('status', ['pendente','confirmado'])
+    .order('inicio', { ascending: true });
+
+  if (error) throw error;
+  return ok({ data });
+}
+
+if (req.method === 'POST') {
+  const { paciente_id, paciente_novo, inicioISO, fimISO, tipo_consulta_id, observacoes } = await req.json();
+  let pid = paciente_id;
+
+  // cadastro rápido
+  if (!pid && paciente_novo?.nome) {
+    const { data: novo, error: e1 } = await supabase
+      .from('pacientes')
+      .insert({
+        nome: paciente_novo.nome,
+        telefone: paciente_novo.telefone,
+        email: paciente_novo.email,
+        convenio: paciente_novo.convenio || 'PARTICULAR',
+        ativo: true
+      }).select('id').single();
+    if (e1) throw e1;
+    pid = novo.id;
+  }
+
+  if (!pid) throw new Error('Informe paciente_id ou paciente_novo');
+
+  // conflito simples
+  const { data: confl } = await supabase.from('agendamentos')
+    .select('id').or(`and(inicio.lte.${fimISO},fim.gte.${inicioISO})`)
+    .neq('status','cancelado').limit(1);
+
+  if (confl?.length) return err(409,'Horário já ocupado');
+
+  const { data, error } = await supabase
+    .from('agendamentos')
+    .insert({
+      paciente_id: pid, inicio: inicioISO, fim: fimISO,
+      status: 'pendente', origem: 'sistema', observacoes, tipo_consulta_id
+    })
+    .select('id').single();
+
+  if (error) throw error;
+  return ok({ id: data.id });
+}
+
+// helpers ok/err omitidos por brevidade
+
+2.2 /supabase/functions/fila-espera/index.ts
+
+GET lista itens com join de paciente e agendamento (pontos 4, 5, 6).
+
+POST aceita paciente existente ou paciente_novo.
+
+if (req.method === 'GET') {
+  const { data, error } = await supabase
+    .from('fila_espera')
+    .select('*, paciente:pacientes(id,nome,telefone), agendamento:agendamentos(id,inicio,status)')
+    .order('pos', { ascending: true })
+    .order('created_at', { ascending: true });
+  if (error) throw error;
+  return ok({ data });
+}
+
+if (req.method === 'POST') {
+  const { paciente_id, paciente_novo, motivo, prioridade } = await req.json();
+  let pid = paciente_id;
+
+  if (!pid && paciente_novo?.nome) {
+    const { data: novo } = await supabase
+      .from('pacientes')
+      .insert({
+        nome: paciente_novo.nome,
+        telefone: paciente_novo.telefone,
+        convenio: paciente_novo.convenio || 'PARTICULAR',
+        ativo: true
+      }).select('id').single();
+    pid = novo?.id;
+  }
+  if (!pid) throw new Error('Informe paciente_id ou paciente_novo');
+
+  const { data, error } = await supabase
+    .from('fila_espera')
+    .insert({ paciente_id: pid, motivo, prioridade })
+    .select('id').single();
+
+  if (error) throw error;
+  return ok({ id: data.id });
+}
+
+2.3 /supabase/functions/feriados-sync/index.ts
+
+Sincroniza (POST) e CRUD: PUT (editar), DELETE (excluir) — pontos 13–16.
+
+if (req.method === 'POST') { /* sincronizar */ }
+if (req.method === 'PUT') {
+  const { id, data, titulo, recorrente, uf, municipio } = await req.json();
+  const dia_mes = Number(data.slice(8,10)), mes = Number(data.slice(5,7));
+  const { error } = await supabase.from('feriados')
+    .update({ data, titulo, recorrente, uf, municipio, dia_mes, mes })
+    .eq('id', id);
+  if (error) throw error; return ok();
+}
+if (req.method === 'DELETE') {
+  const url = new URL(req.url); const id = url.searchParams.get('id');
+  const { error } = await supabase.from('feriados').delete().eq('id', id);
+  if (error) throw error; return ok();
+}
+
+3) API (Next) – proxies
+
+/api/agendamentos: encaminhar GET?scope&start&end, POST (cadastro rápido opcional).
+
+/api/fila-espera: GET lista, POST inclui.
+
+/api/feriados: POST sincronizar; PUT editar; DELETE?id=... excluir.
+
+4) Front – Sistema Principal
+4.1 Agenda (itens 1, 2, 3, 7)
+
+Motivo de não aparecer: consulta limitada a status='confirmado' ou janela de tempo errada.
+➜ Ajuste consulta para incluir pendente e range correto (dia/semana/mês).
+
+Seletor de data + tabs Dia/Semana/Mês com fetch apropriado (usar start/end ISO).
+
+Cadastro rápido dentro do modal de agendamento:
+
+Alternador “Paciente cadastrado” / “Novo paciente”.
+
+Se “Novo”, capturar nome, telefone, convênio (inclui PARTICULAR) e (opcional) e-mail; enviar como paciente_novo no POST.
+
+Tipo de consulta: select puxando de tipos_consulta.
+
+Exemplo (modal - trecho crítico)
+const [modoPaciente, setModoPaciente] = useState<'existe'|'novo'>('existe');
+// ...
+{modoPaciente==='novo' && (
+  <>
+    <input placeholder="Nome" onChange={...}/>
+    <input placeholder="Telefone" onChange={...}/>
+    <select onChange={...}>
+      {['UNIMED','UNIMED UNIFÁCIL','CASSI','CABESP','PARTICULAR'].map(c=> <option key={c}>{c}</option>)}
+    </select>
+  </>
+)}
+<select onChange={e=>setTipoConsultaId(e.target.value)}>
+  {tipos.map(t => <option key={t.id} value={t.id}>{t.nome}</option>)}
+</select>
+<button onClick={salvarAgendamento}>Salvar</button>
+
+4.2 Fila de espera (itens 4, 5, 6)
+
+Carregar com GET /api/fila-espera (que já traz paciente e agendamento).
+
+Form “Adicionar à fila”: escolher paciente ou cadastrar rápido (como no agendamento), enviando paciente_novo no POST.
+
+Exibir a lista; se vazia, mostrar “Nenhum registro encontrado”.
+
+4.3 Pacientes (item 8)
+
+Campo Convênio: incluir “PARTICULAR” no select.
+
+4.4 Painel de Mensagens – App/WhatsApp (itens 9, 10, 11, 12)
+
+Dois botões de alternância:
+
+“Mensagens App” (carrega de app_messages)
+
+“Mensagens WhatsApp” (carrega de whatsapp_messages)
+
+Badges com contagem de não lidas (consultar vw_unread_app e vw_unread_whats).
+
+Render obrigatório do paciente: ao montar a query, faça select(..., paciente:pacientes(id,nome)) e mostre paciente.nome.
+
+Encaminhar: botão “Encaminhar para Médico” abre select com médicos; pré-selecionar “Dr. Francisco”. Ao confirmar, grava registro de encaminhamento (tabela encaminhamentos ou campo na própria mensagem).
+
+4.5 Feriados (itens 13–16)
+
+Ao clicar “Sincronizar Automático”: POST /api/feriados (Edge feriados-sync), tratar erro com toast; após sucesso, reload.
+
+Na listagem, botões Editar (abre modal; PUT /api/feriados) e Excluir (DELETE /api/feriados?id=...).
+
+No modal de criação/edição, checkbox “Repetir todos os anos” → grava recorrente=true.
+
+Na Agenda (Principal e App Paciente), destaque feriados:
+
+se recorrente, compare mes/dia_mes; se não, compare data.
+
+5) App Paciente – Login (item 17)
+
+Loop ao logar: padronize o hook de auth como abaixo (evita busca dupla/loop):
+
+const [user,setUser] = useState(null);
+const [loading,setLoading] = useState(true);
+
+useEffect(()=>{
+  let alive = true;
+  (async ()=>{
+    const { data: { session } } = await supabase.auth.getSession();
+    if (alive) setUser(session?.user ?? null);
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s)=>{
+      if (alive) setUser(s?.user ?? null);
+    });
+    setLoading(false);
+    return ()=>sub.subscription.unsubscribe();
+  })();
+  return ()=>{ alive=false; };
+},[]);
+
+
+Somente redirecione após loading === false.
+
+No login bem-sucedido, router.replace('/app/home').
+
+Checklist ➜ seus 17 itens
+
+Agenda não mostra agendamentos ➜ GET com range + status in (pendente,confirmado) ✅
+
+“Erro ao criar agendamento” ➜ POST robusto + RLS/Service Role ✅
+
+Agendar para não cadastrados ➜ cadastro rápido no modal ✅
+4–6) Lista de espera não lista/salva/seleciona ➜ GET join + POST com paciente_novo ✅
+
+Tipo de consulta com lista ➜ tabela tipos_consulta + select ✅
+
+Convênio PARTICULAR no Paciente ✅
+9–12) Painel de Mensagens: dois botões (App/Whats) + badges “não lidas” + paciente obrigatório + “Encaminhar” (Dr. Francisco default) ✅
+13–16) Feriados: sincronizar sem erro + editar/excluir + recorrência “todos os anos” + salvar sem erro ✅
+
+App Paciente login corrige loop ✅

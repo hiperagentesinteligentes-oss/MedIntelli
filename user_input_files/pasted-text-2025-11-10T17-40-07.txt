@@ -1,0 +1,267 @@
+roteiro técnico consolidado e completo, que você pode copiar e colar diretamente no MiniMax — ele abrange:
+1️⃣ A integração OpenAI com Base Única de Conhecimento,
+2️⃣ A função Pacientes (busca, cadastro, edição, exclusão, ativar/inativar e convênios validados),
+3️⃣ E a correção do looping no Painel de Mensagens (App Paciente e WhatsApp).
+
+🧠 ORIENTAÇÃO COMPLETA PARA O MINIMAX
+🔧 SISTEMA PRINCIPAL + APP PACIENTE + OPENAI + SUPABASE
+Versão 2.0 — Correções e Expansões Funcionais
+🧩 1️⃣ INTEGRAÇÃO COM OPENAI E BASE DE CONHECIMENTO
+OBJETIVO
+
+Implementar respostas inteligentes e automáticas no WhatsApp e App Paciente, utilizando:
+
+Modelo GPT-4-Turbo (via OpenAI API),
+
+Base Única de Conhecimento (BUC) centralizada,
+
+E ações automáticas (agendar, cancelar, responder exames).
+
+VARIÁVEIS OBRIGATÓRIAS .env
+OPENAI_API_KEY=colocar_sua_chave_aqui
+OPENAI_MODEL=gpt-4-turbo
+BASE_KNOWLEDGE_PATH=./knowledge/base_conhecimento.txt
+
+ESTRUTURA DE ARQUIVOS
+src/lib/openai.ts
+supabase/functions/agent-ia/index.ts
+knowledge/base_conhecimento.txt
+
+📘 /src/lib/openai.ts
+import OpenAI from "openai";
+import fs from "fs";
+
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+
+export async function carregarBaseConhecimento() {
+  try {
+    const path = process.env.BASE_KNOWLEDGE_PATH || "./knowledge/base_conhecimento.txt";
+    return fs.existsSync(path) ? fs.readFileSync(path, "utf-8") : "";
+  } catch {
+    return "";
+  }
+}
+
+export async function gerarRespostaIA(mensagem: string, contexto: string) {
+  const prompt = `
+Você é um assistente digital da clínica MedIntelli.
+Use linguagem empática, técnica e respeitosa.
+Baseie-se exclusivamente na Base de Conhecimento abaixo.
+Se a mensagem exigir ação, indique no JSON.
+
+--- BASE DE CONHECIMENTO ---
+${contexto}
+
+--- MENSAGEM ---
+${mensagem}
+
+Responda com JSON estruturado assim:
+{
+  "resposta": "texto da resposta para o paciente",
+  "acao": "agendar|cancelar|exame|informacao",
+  "dados": { ... se houver ... }
+}
+`;
+  try {
+    const completion = await client.chat.completions.create({
+      model: process.env.OPENAI_MODEL || "gpt-4-turbo",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.4,
+    });
+    return completion.choices[0].message?.content || "";
+  } catch {
+    return '{"resposta":"Desculpe, estou indisponível no momento."}';
+  }
+}
+
+⚙️ /supabase/functions/agent-ia/index.ts
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { carregarBaseConhecimento, gerarRespostaIA } from "../../../src/lib/openai.ts";
+
+Deno.serve(async (req) => {
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  );
+
+  try {
+    const { mensagem, paciente_id, origem } = await req.json();
+    const contexto = await carregarBaseConhecimento();
+    const respostaJSON = await gerarRespostaIA(mensagem, contexto);
+    const result = JSON.parse(respostaJSON);
+
+    // Grava histórico
+    await supabase.from("whatsapp_messages").insert({
+      paciente_id,
+      origem: origem || "app",
+      mensagem: result.resposta,
+      tipo: "resposta",
+      data_envio: new Date().toISOString(),
+    });
+
+    // Executa ação (se houver)
+    if (result.acao === "agendar") {
+      await supabase.from("agendamentos").insert(result.dados);
+    }
+
+    return new Response(JSON.stringify({ ok: true, resposta: result.resposta }), { status: 200 });
+  } catch (e) {
+    console.error("Erro no agente IA:", e);
+    return new Response(JSON.stringify({ ok: false, erro: e.message }), { status: 400 });
+  }
+});
+
+📄 /knowledge/base_conhecimento.txt
+BASE DE CONHECIMENTO - CLÍNICA MEDINTELLI
+
+1. Horário de funcionamento: Segunda a Sexta, das 8h às 18h.
+2. Especialidades: Neurologia, Psiquiatria e Clínica Geral.
+3. Convênios atendidos:
+   ✅ UNIMED (exceto UNIMED Essencial)
+   ✅ UNIMED UNIFÁCIL (primeira consulta com encaminhamento e autorização)
+   ✅ CASSI
+   ✅ CABESP
+4. A IA pode orientar sobre agendamentos, cancelamentos, resultados de exames e dúvidas médicas gerais.
+5. Para novos pacientes, são necessários: nome completo, telefone, e data de nascimento.
+6. Consultas devem ser confirmadas pela equipe antes da realização.
+7. Em caso de urgência, procurar o pronto atendimento.
+
+👩‍⚕️ 2️⃣ MÓDULO PACIENTES — COMPLETO (CRUD + BUSCA + CONVÊNIOS)
+📋 Funcionalidades obrigatórias:
+Função	Descrição
+🔍 Buscar Pacientes	Campo de busca por nome, telefone, e e-mail (filtro incremental).
+➕ Cadastrar Novo	Formulário com validação de convênio e campos obrigatórios.
+✏️ Editar	Permite alterar dados cadastrais e convênio.
+🗑️ Excluir	Remove o registro definitivamente (com confirmação).
+🚫 Ativar/Inativar	Altera flag ativo:boolean sem excluir o paciente.
+💾 Tabela pacientes (Supabase)
+alter table pacientes
+  add column if not exists ativo boolean default true,
+  add column if not exists convenio text check (convenio in ('UNIMED','UNIMED UNIFÁCIL','CASSI','CABESP'));
+
+🧠 Validação de convênio no frontend
+const conveniosPermitidos = [
+  "UNIMED",
+  "UNIMED UNIFÁCIL",
+  "CASSI",
+  "CABESP"
+];
+
+
+Ao cadastrar:
+
+if (!conveniosPermitidos.includes(convenio)) {
+  alert("Convênio não aceito. Escolha um convênio válido.");
+  return;
+}
+
+🧩 Endpoints REST (API Next)
+
+GET /api/pacientes?search=
+
+Busca por nome, telefone ou e-mail (like).
+
+POST /api/pacientes
+
+Cria paciente com ativo=true.
+
+PUT /api/pacientes
+
+Atualiza cadastro existente.
+
+PATCH /api/pacientes/ativo
+
+Alterna campo ativo.
+
+DELETE /api/pacientes?id=
+
+Remove paciente.
+
+🖥️ Frontend (src/pages/pacientes/index.tsx)
+
+Tabela com paginação e cores:
+
+🟢 ativo
+
+🔴 inativo
+
+Botões: Editar, Inativar/Ativar, Excluir
+
+Barra de busca em tempo real
+
+Formulário modal de edição com nome, telefone, convenio, data_nascimento, email.
+
+💬 3️⃣ CORREÇÃO DO LOOPING — PAINEL DE MENSAGENS
+PROBLEMA:
+
+Nas abas “Mensagens App Paciente” e “Mensagens WhatsApp”, o sistema fica preso em “Carregando mensagens...”.
+
+CAUSA:
+
+O useEffect de carregamento tem dependência circular (mensagens dentro da própria lista de dependências) ou está aguardando resposta indefinidamente do Supabase.
+
+✅ SOLUÇÃO
+
+Arquivo: src/pages/mensagens/index.tsx
+
+useEffect(() => {
+  let ativo = true;
+  setLoading(true);
+
+  const carregar = async () => {
+    const { data, error } = await supabase
+      .from("whatsapp_messages")
+      .select("id, paciente_id, mensagem, origem, tipo, created_at")
+      .order("created_at", { ascending: false })
+      .limit(200);
+
+    if (!ativo) return;
+    if (error) console.error(error);
+    else setMensagens(data);
+    setLoading(false);
+  };
+
+  carregar();
+
+  // Atualização periódica (sem loop)
+  const interval = setInterval(carregar, 15000);
+
+  return () => {
+    ativo = false;
+    clearInterval(interval);
+  };
+}, []); // ⚠️ sem dependências
+
+
+E no JSX:
+
+{loading ? (
+  <div className="p-4 text-gray-500">Carregando mensagens...</div>
+) : mensagens.length ? (
+  mensagens.map((m) => (
+    <div key={m.id} className="border-b py-2 text-sm">
+      <strong>{m.origem.toUpperCase()}</strong>: {m.mensagem}
+    </div>
+  ))
+) : (
+  <div className="p-4 text-gray-400">Nenhuma mensagem encontrada</div>
+)}
+
+🧩 OTIMIZAÇÕES
+
+Adicionar índice no Supabase:
+
+create index if not exists idx_whatsapp_created_at on whatsapp_messages(created_at desc);
+
+
+Paginar resultados e usar limite máximo de 200 mensagens por vez.
+
+Adicionar botão “Recarregar”.
+
+✅ RESULTADO FINAL ESPERADO
+Módulo	Resultado
+💬 IA	Responde automaticamente, com contexto da base de conhecimento e ações automáticas.
+🩺 Pacientes	CRUD completo + convênios validados + ativar/inativar.
+📱 WhatsApp / App Chat	Mensagens carregam corretamente, sem looping.
+🧠 OpenAI	Usa modelo GPT-4-Turbo com contexto real da clínica e segurança.
+🧾 Logs	Mensagens e respostas registradas no Supabase com origem e timestamp.

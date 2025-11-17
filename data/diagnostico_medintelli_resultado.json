@@ -1,0 +1,103 @@
+{
+  "diagnostico": {
+    "sistema": "MedIntelli - Sistema de Gestão Clínica",
+    "url": "https://nq1tf5hjkkcw.space.minimax.io/diagnostics-full",
+    "timestamp": "2025-11-12T21:29:41",
+    "usuario": {
+      "nome": "Alencar",
+      "perfil": "Administrador",
+      "email": "alencar@medintelli.com.br",
+      "status": "Ativo"
+    },
+    "status_geral": "Operacional com pendências",
+    "resumo_problemas": [
+      "Sessão Supabase não estabelecida",
+      "9 de 10 Edge Functions com erro 401",
+      "Schema do banco com colunas/tabelas faltantes"
+    ]
+  },
+  "componentes": {
+    "ambiente": {
+      "status": "OK",
+      "supabase_url": "OK",
+      "anon_key": "OK",
+      "vite_supabase_url": true,
+      "vite_supabase_anon_key": true
+    },
+    "sessao_supabase": {
+      "status": "SEM_SESSAO_ATIVA",
+      "problema": "Usuário logado na web mas sessão Supabase não estabelecida",
+      "impacto": "Alto - Afeta todas as Edge Functions autenticadas"
+    },
+    "edge_functions": {
+      "status": "ERRO_AUTORIZACAO",
+      "funcoes": {
+        "agendamentos": {"status": 401, "funcionando": false},
+        "whatsapp-send-message": {"status": 401, "funcionando": false},
+        "fila-espera": {"status": 401, "funcionando": false},
+        "feriados": {"status": 401, "funcionando": false},
+        "pacientes": {"status": 401, "funcionando": false},
+        "mensagens-app": {"status": 401, "funcionando": false},
+        "mensagens-whatsapp": {"status": 200, "funcionando": true},
+        "base-conhecimento": {"status": 401, "funcionando": false},
+        "usuarios": {"status": 401, "funcionando": false},
+        "dashboard-medico": {"status": 401, "funcionando": false}
+      },
+      "estatisticas": {
+        "total": 10,
+        "funcionando": 1,
+        "com_erro": 9,
+        "taxa_sucesso": "10%"
+      }
+    },
+    "banco_dados": {
+      "status": "PARCIALMENTE_FUNCIONAL",
+      "tabelas": {
+        "agendamentos": {"status": "OK", "registros": 5},
+        "fila_espera": {"status": "OK", "registros": 4},
+        "pacientes": {"status": "OK", "registros": 5},
+        "usuarios": {"status": "OK", "registros": 5},
+        "feriados": {"status": "OK", "registros": 5},
+        "mensagens_app": {"status": "VAZIO", "registros": 0, "observacao": "Esperado se não utilizado"},
+        "whatsapp_messages": {"status": "ERRO_SCHEMA", "erro": "column whatsapp_messages.paciente_id does not exist"},
+        "knowledge_base": {"status": "ERRO_SCHEMA", "erro": "Could not find the table 'public.knowledge_base' in the schema cache"}
+      }
+    },
+    "dashboard_medico": {
+      "status": "VAZIO",
+      "metricas": {
+        "agendamentos_hoje": 0,
+        "mensagens_pendentes": 0,
+        "exames_novos": 0
+      }
+    }
+  },
+  "acoes_executadas": [
+    "Login realizado com sucesso (alencar@medintelli.com.br)",
+    "Navegação para /diagnostics-full concluída",
+    "Diagnóstico completo executado via botão 'Reexecutar Diagnóstico'",
+    "Screenshot e documentação gerados"
+  ],
+  "recomendacoes": {
+    "prioridade_alta": [
+      "Investigar autenticação web-Supabase",
+      "Fazer redeploy das Edge Functions",
+      "Verificar variáveis de ambiente no Supabase"
+    ],
+    "prioridade_media": [
+      "Adicionar coluna paciente_id à tabela whatsapp_messages",
+      "Criar/restaurar tabela knowledge_base",
+      "Verificar migrações do banco de dados"
+    ],
+    "proximos_passos": [
+      "Corrigir sessão Supabase",
+      "Reexecutar diagnóstico após correções",
+      "Validar funcionamento individual dos módulos"
+    ]
+  },
+  "arquivos_gerados": [
+    "/workspace/docs/relatorio_diagnostico_medintelli.md",
+    "/workspace/browser/screenshots/diagnostico_completo_medintelli.png",
+    "/workspace/browser/extracted_content/medintelli_diagnostic.json"
+  ]
+}

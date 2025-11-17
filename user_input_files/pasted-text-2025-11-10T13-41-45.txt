@@ -1,0 +1,534 @@
+vou te entregar um Patch Pack objetivo (SQL + Edge Functions + React/Next) cobrindo os 23 pontos. É só colar por arquivo nos caminhos indicados. Tudo segue a mesma arquitetura que já combinamos (Supabase + Next.js + Avisa API + BUC).
+
+Dica: faça os patches na ordem: SQL ➜ Functions ➜ API proxies ➜ Front. Reinicie o dev server ao final.
+
+0) SQL — ajustes de schema, índices e RPCs
+0.1 Novas colunas/índices
+-- FILA: posição DnD + vínculo obrigatório ao agendamento
+alter table fila_espera add column if not exists pos int;
+alter table fila_espera add column if not exists agendamento_id uuid references agendamentos(id);
+create index if not exists idx_fila_pos on fila_espera(pos);
+
+-- FERIADOS: recorrência anual
+alter table feriados add column if not exists recorrente boolean default false;
+alter table feriados add column if not exists dia_mes int;
+alter table feriados add column if not exists mes int;
+update feriados set dia_mes = extract(day from data), mes = extract(month from data)
+where dia_mes is null or mes is null;
+
+-- PACIENTES: garantir índices
+create index if not exists idx_pacientes_nome on pacientes (nome);
+create index if not exists idx_pacientes_telefone on pacientes (telefone);
+
+-- AGENDA: performance
+create index if not exists idx_agend_inicio on agendamentos(inicio);
+create index if not exists idx_agend_paciente on agendamentos(paciente_id);
+
+-- WHATSAPP: performance mensagens
+create index if not exists idx_whats_created on whatsapp_messages(created_at desc);
+create index if not exists idx_whats_paciente on whatsapp_messages(paciente_id);
+
+0.2 RPC – contagem mês/dia e slots livres
+-- já tínhamos a contagem por dia; mantém
+create or replace function public.agenda_contagem_por_dia(_inicio timestamptz, _fim timestamptz)
+returns table(dia date, total bigint)
+language sql stable as $$
+  select (a.inicio at time zone 'America/Sao_Paulo')::date as dia, count(*) as total
+  from agendamentos a
+  where a.inicio >= _inicio and a.inicio < _fim and a.status <> 'cancelado'
+  group by 1 order by 1;
+$$;
+
+-- slots livres (agenda de 08:00-18:00, blocos de 30 min) para um dia
+create or replace function public.horarios_livres(_dia date)
+returns table(inicio timestamptz, fim timestamptz)
+language plpgsql stable as $$
+declare
+  cursor_time timestamptz := (_dia::timestamptz + time '08:00');
+  end_time   timestamptz := (_dia::timestamptz + time '18:00');
+  overl bigint;
+begin
+  while cursor_time < end_time loop
+    select count(1) into overl
+    from agendamentos a
+    where a.status <> 'cancelado'
+      and a.inicio < cursor_time + interval '30 min'
+      and a.fim    > cursor_time;
+
+    if overl = 0 then
+      inicio := cursor_time;
+      fim    := cursor_time + interval '30 min';
+      return next;
+    end if;
+
+    cursor_time := cursor_time + interval '30 min';
+  end loop;
+end; $$;
+
+1) Edge Functions — correções e novas rotas
+1.1 supabase/functions/agendamentos/index.ts (adições)
+
+GET diário para a Day View e ver pendentes do APP Paciente.
+
+Sugerir 3 horários (para usar na Fila de Espera ➜ “Agendar”).
+
+// ... topo igual (createClient etc.)
+Deno.serve(async (req) => {
+  // CORS...
+  const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
+
+  try {
+    const url = new URL(req.url);
+    if (req.method === 'GET') {
+      const dia = url.searchParams.get('dia'); // YYYY-MM-DD
+      if (!dia) return new Response(JSON.stringify({ error: 'Parâmetro dia é obrigatório' }), { status:400 });
+      const start = `${dia}T00:00:00.000Z`;
+      const end   = `${dia}T23:59:59.999Z`;
+      const { data, error } = await supabase
+        .from('agendamentos')
+        .select('*, paciente:pacientes(*)')
+        .gte('inicio', start).lte('fim', end)
+        .order('inicio', { ascending: true });
+      if (error) throw error;
+      return new Response(JSON.stringify({ ok: true, data }), { status:200 });
+    }
+
+    if (req.method === 'POST') {
+      const { paciente_id, inicioISO, fimISO, status='pendente', origem='app', observacoes } = await req.json();
+      if (!paciente_id || !inicioISO || !fimISO) throw new Error('Dados obrigatórios ausentes');
+
+      // conflito
+      const { data: conflito } = await supabase
+        .from('agendamentos')
+        .select('id')
+        .or(`and(inicio.lte.${fimISO},fim.gte.${inicioISO})`)
+        .neq('status','cancelado')
+        .limit(1);
+      if (conflito && conflito.length) return new Response(JSON.stringify({ error: 'Conflito de horário' }), { status: 409 });
+
+      const { data, error } = await supabase
+        .from('agendamentos')
+        .insert({ paciente_id, inicio: inicioISO, fim: fimISO, status, origem, observacoes })
+        .select('*').single();
+      if (error) throw error;
+      return new Response(JSON.stringify({ ok: true, agendamento: data }), { status:200 });
+    }
+
+    if (req.method === 'PUT') {
+      const body = await req.json();
+      const { id, ...fields } = body;
+      if (!id) throw new Error('ID ausente');
+      const { data, error } = await supabase.from('agendamentos')
+        .update({ ...fields, updated_at: new Date().toISOString() }).eq('id', id).select('*').single();
+      if (error) throw error;
+      return new Response(JSON.stringify({ ok:true, agendamento: data }), { status:200 });
+    }
+
+    if (req.method === 'PATCH') {
+      // sugerir 3 horários: PATCH { sugerir:true, dia:'YYYY-MM-DD' }
+      const { sugerir, dia } = await req.json();
+      if (!sugerir || !dia) return new Response(JSON.stringify({ error: 'Payload inválido' }), { status:400 });
+      const { data, error } = await supabase.rpc('horarios_livres', { _dia: dia });
+      if (error) throw error;
+      const sugestoes = (data || []).slice(0,3);
+      return new Response(JSON.stringify({ ok:true, sugestoes }), { status:200 });
+    }
+
+    return new Response(JSON.stringify({ error: 'Method not allowed' }), { status:405 });
+  } catch(e:any) {
+    return new Response(JSON.stringify({ error: e.message }), { status:400 });
+  }
+});
+
+1.2 supabase/functions/fila-espera/index.ts (editar, remover, DnD)
+// adicionar métodos PUT (editar), DELETE (remover), PATCH (reordenar)
+if (req.method === 'PUT') {
+  const { id, motivo, prioridade, status } = await req.json();
+  if (!id) throw new Error('ID ausente');
+  const { data, error } = await supabase.from('fila_espera').update({ motivo, prioridade, status }).eq('id', id).select('*').single();
+  if (error) throw error;
+  return new Response(JSON.stringify({ ok:true, data }), { status:200, headers });
+}
+
+if (req.method === 'DELETE') {
+  const url = new URL(req.url);
+  const id = url.searchParams.get('id');
+  if (!id) throw new Error('ID ausente');
+  const { error } = await supabase.from('fila_espera').delete().eq('id', id);
+  if (error) throw error;
+  return new Response(JSON.stringify({ ok:true }), { status:200, headers });
+}
+
+if (req.method === 'PATCH') {
+  const { ordenacao } = await req.json(); // [{id, pos}, ...]
+  if (!Array.isArray(ordenacao)) throw new Error('Payload inválido');
+  for (const o of ordenacao) {
+    await supabase.from('fila_espera').update({ pos: o.pos }).eq('id', o.id);
+  }
+  return new Response(JSON.stringify({ ok:true }), { status:200, headers });
+}
+
+
+Validação de inclusão (obrigatório ter agendamento):
+
+No POST, se vier paciente_id sem agendamento_id, crie um agendamento pendente ou recuse com erro claro. Exemplo:
+
+if (req.method === 'POST') {
+  const { paciente_id, motivo, prioridade='media', agendamento_id } = await req.json();
+  if (!paciente_id || !motivo) throw new Error('Dados obrigatórios ausentes');
+
+  let aid = agendamento_id;
+  if (!aid) {
+    // cria agendamento pendente no próximo slot livre hoje
+    const today = new Date().toISOString().slice(0,10);
+    const sl = await supabase.rpc('horarios_livres', { _dia: today });
+    const slot = (sl.data || [])[0];
+    if (!slot) throw new Error('Sem slot livre para criar agendamento de espera');
+    const { data: novo } = await supabase
+      .from('agendamentos')
+      .insert({ paciente_id, inicio: slot.inicio, fim: slot.fim, status:'pendente', origem:'manual', observacoes:'fila_espera' })
+      .select('id').single();
+    aid = novo?.id;
+  }
+
+  const { data, error } = await supabase
+    .from('fila_espera')
+    .insert({ paciente_id, motivo, prioridade, agendamento_id: aid })
+    .select('*').single();
+  if (error) throw error;
+  return new Response(JSON.stringify({ ok:true, data }), { status:200, headers });
+}
+
+1.3 supabase/functions/feriados-sync/index.ts (recorrência)
+
+Adicionar suporte a recorrente e “pintar” depois na agenda (front).
+
+if (req.method === 'POST') {
+  const { feriados } = await req.json();
+  for (const f of (feriados||[])) {
+    const data = f.data; // YYYY-MM-DD
+    const dia_mes = Number(data.slice(8,10));
+    const mes     = Number(data.slice(5,7));
+    await supabase.from('feriados').upsert({
+      data, titulo: f.titulo, escopo: f.escopo || 'nacional',
+      municipio: f.municipio || null, uf: f.uf || null,
+      recorrente: !!f.recorrente, dia_mes, mes
+    }, { onConflict: 'data' });
+  }
+  return new Response(JSON.stringify({ ok:true }), { status:200, headers });
+}
+
+1.4 supabase/functions/whatsapp-webhook-receiver/index.ts (garantir painel e IA)
+
+Quando chegar mensagem do APP (ou WhatsApp), insira em whatsapp_messages se ainda não existe e dispare agent-ia como antes (isso resolve itens 11, 12, 21).
+
+2) API proxies
+2.1 Novos/ajustados
+
+/api/agendamentos — agora permite GET ?dia=YYYY-MM-DD e PATCH com {sugerir, dia}.
+
+/api/fila-espera — agora aceita PUT, PATCH, DELETE?id=....
+
+/api/pacientes — CRUD completo (novo).
+
+/api/feriados — suporta recorrência.
+
+Se já tem esses proxies, apenas reencaminhe os métodos/paths para as Edge Functions atualizadas.
+
+3) Front — Sistema Principal
+3.1 Dashboard: cards clicáveis + rápido
+
+src/pages/index.tsx (ou dashboard)
+
+Faça cada card um <Link> para a rota alvo.
+
+Carregue contadores via Promise.all em uma única chamada (ou um endpoint agregador).
+
+Mostre skeleton enquanto busca.
+
+import Link from 'next/link';
+// ...
+<div className="grid md:grid-cols-3 gap-3">
+  <Link href="/agenda" className="p-4 rounded shadow hover:scale-[1.01] transition bg-white border">
+    <div className="text-sm text-gray-500">Agendamentos hoje</div>
+    <div className="text-2xl font-semibold">{cont.agendaHoje}</div>
+  </Link>
+  <Link href="/fila-espera" className="p-4 rounded shadow hover:scale-[1.01] transition bg-white border">
+    <div className="text-sm text-gray-500">Fila de Espera</div>
+    <div className="text-2xl font-semibold">{cont.fila}</div>
+  </Link>
+  <Link href="/pacientes/painel" className="p-4 rounded shadow hover:scale-[1.01] transition bg-white border">
+    <div className="text-sm text-gray-500">Mensagens pendentes</div>
+    <div className="text-2xl font-semibold">{cont.msgPendentes}</div>
+  </Link>
+</div>
+
+3.2 Agenda: tabs Mês/Semana/Dia funcionando
+
+Garanta state único mode e renderize AgendaMonth, AgendaWeek, AgendaDay.
+
+Dia: inclui botão “+” ao lado de cada horário livre (usa RPC horarios_livres).
+
+src/components/AgendaDay.tsx (novo)
+
+import React, { useEffect, useState } from 'react';
+import { supabase } from '@/lib/supabase';
+
+export default function AgendaDay({ dia }: { dia: string }) {
+  const [items, setItems] = useState<any[]>([]);
+  const [livres, setLivres] = useState<any[]>([]);
+
+  useEffect(()=>{ load(); }, [dia]);
+
+  async function load(){
+    const r1 = await fetch('/api/agendamentos?dia=' + dia);
+    const j1 = await r1.json(); setItems(j1.data||[]);
+    const { data: sl } = await supabase.rpc('horarios_livres', { _dia: dia });
+    setLivres(sl || []);
+  }
+
+  async function agendarRapido(inicio: string, fim: string){
+    const paciente_id = prompt('ID do paciente:');
+    if (!paciente_id) return;
+    const res = await fetch('/api/agendamentos', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ paciente_id, inicioISO: inicio, fimISO: fim, origem:'manual', status:'confirmado' })
+    });
+    if (!res.ok) alert('Erro ao agendar');
+    else load();
+  }
+
+  return (
+    <div className="grid md:grid-cols-2 gap-3">
+      <div className="border rounded p-3">
+        <h3 className="font-medium">Agendados</h3>
+        <ul className="space-y-1">
+          {items.map((a:any)=>(
+            <li key={a.id} className="border-b py-1 text-sm">
+              {new Date(a.inicio).toLocaleTimeString()} — {a.paciente?.nome || '—'} ({a.status})
+            </li>
+          ))}
+        </ul>
+      </div>
+      <div className="border rounded p-3">
+        <h3 className="font-medium">Livres (clique “+” para agendar)</h3>
+        <ul className="space-y-1">
+          {livres.map((h:any, i:number)=>(
+            <li key={i} className="flex justify-between items-center border-b py-1 text-sm">
+              <span>{new Date(h.inicio).toLocaleTimeString()} — {new Date(h.fim).toLocaleTimeString()}</span>
+              <button onClick={()=>agendarRapido(h.inicio, h.fim)} className="px-2 py-1 border rounded">+</button>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+
+No /agenda, renderize:
+
+{mode==='day'   && <AgendaDay dia={selectedDay /* 'YYYY-MM-DD' */} />}
+
+
+(Selecione selectedDay a partir do clique no mensal/semanal.)
+
+3.3 Fila de Espera: DnD + Remover + “Agendar” (3 sugestões)
+
+Troque setas ▲▼ por arrastar e soltar com HTML5 nativo (sem lib).
+
+Botão Remover usa DELETE.
+
+Botão Agendar: chama /api/agendamentos PATCH {sugerir:true, dia} para pegar 3 sugestões; clique em uma cria agendamento confirmado e remove da fila.
+
+Trecho na lista (substituir):
+
+<li key={it.id}
+    draggable
+    onDragStart={(e)=>e.dataTransfer.setData('text/plain', it.id)}
+    onDragOver={(e)=>e.preventDefault()}
+    onDrop={async (e)=>{
+      const from = e.dataTransfer.getData('text/plain');
+      if (from && from !== it.id) {
+        const ordenacao = [
+          { id: from, pos: it.pos ?? 0 },
+          { id: it.id, pos: items.findIndex(x=>x.id===from) }
+        ];
+        await fetch('/api/fila-espera', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ ordenacao }) });
+        await load();
+      }
+    }}
+    className="border p-2 rounded text-sm"
+>
+  <div className="flex justify-between items-center">
+    <div>
+      <div>Paciente: {it.paciente_id} · {it.motivo}</div>
+      <div className="text-gray-500">Agendamento: {it.agendamento_id ? 'vinculado' : '—'}</div>
+    </div>
+    <div className="flex gap-2">
+      <button className="px-2 py-1 border rounded" onClick={async()=>{
+        const dia = prompt('Dia para sugerir (YYYY-MM-DD)') ?? new Date().toISOString().slice(0,10);
+        const r = await fetch('/api/agendamentos', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ sugerir:true, dia }) });
+        const j = await r.json();
+        if (!j.ok || !j.sugestoes?.length) return alert('Sem sugestões');
+        const opt = j.sugestoes.map((s: any, idx:number)=> `${idx+1}) ${new Date(s.inicio).toLocaleString()}-${new Date(s.fim).toLocaleTimeString()}`).join('\n');
+        const choose = prompt('Escolha uma opção:\n' + opt);
+        const sel = Number(choose) - 1;
+        const pick = j.sugestoes[sel];
+        if (!pick) return;
+        const a = await fetch('/api/agendamentos', { method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ paciente_id: it.paciente_id, inicioISO: pick.inicio, fimISO: pick.fim, origem:'manual', status:'confirmado' })
+        });
+        if (!a.ok) return alert('Falha ao agendar');
+        await fetch('/api/fila-espera?id='+it.id, { method:'DELETE' });
+        await load();
+      }}>Agendar</button>
+      <button className="px-2 py-1 border rounded" onClick={async()=>{
+        await fetch('/api/fila-espera?id='+it.id, { method:'DELETE' });
+        await load();
+      }}>Remover</button>
+    </div>
+  </div>
+</li>
+
+
+Form inclusão (erro 9)
+
+Permitir digitar nome/telefone ou buscar cadastrado:
+
+Se não existe paciente, crie em pacientes.
+
+Crie agendamento pendente (se não for informado) e vincule agendamento_id na fila_espera.
+
+No save() do form, envie { paciente_id | nome, telefone, motivo, prioridade } e ajuste o POST da function para criar paciente se necessário.
+
+3.4 Pacientes (CRUD + melhor navegação)
+
+src/pages/pacientes/index.tsx:
+
+Lista paginada (range(0,49)), barra de busca por nome/telefone, botões Novo, Editar, Excluir.
+
+Use API /api/pacientes (GET/POST/PUT/DELETE).
+
+3.5 Painel de Mensagens — melhorar navegabilidade
+
+Filtros por categoria/tipo/período/paciente.
+
+Paginação (50/100).
+
+Botões de “Responder/Encaminhar”.
+
+Debounce na busca para evitar loops.
+
+3.6 Feriados — corrigir looping + recorrência
+
+Em React, useEffect sem dependências incorretas (evite usar objeto como dep).
+
+Após sincronizar automático, upsert e recarregue.
+
+Destacar na agenda: em AgendaMonth, pinte dias feriados com um dot/label (busque feriados do mês; se recorrente=true, compare dia_mes/mes).
+
+3.7 Usuários — loop e “salvando” travado
+
+useEffect: useEffect(()=>{ load() },[]) (sem colocar list como dependência).
+
+No create()/update(), aguarde fetch e setLoading(false) no finally.
+
+Mostrar toast de sucesso/erro e limpar form.
+
+3.8 Menu superior — layout moderno e responsivo
+
+Aplique Tailwind: fundo gradiente leve, ícones (lucide-react se já estiver), hambúrguer no mobile, item ativo em destaque.
+
+4) Front — APP Paciente
+4.1 Layout moderno e colorido
+
+Adicione classes Tailwind: bg-gradient-to-br from-sky-50 to-indigo-50, cards com rounded-2xl shadow.
+
+Botões com bg-indigo-600.
+
+4.2 Agendamento mostra só horários disponíveis
+
+Consuma rpc('horarios_livres', { _dia }) e o botão de agendar chama /api/agendamentos (POST).
+
+Ao salvar, status 'pendente' ou 'confirmado' conforme regra — e deve aparecer no Principal pois usa mesma tabela.
+
+4.3 Chat sem looping + mensagens no Painel
+
+Desativar botão enquanto aguarda agent-ia.
+
+Ao enviar, insira também em whatsapp_messages com mensagem_origem='app', garantindo que o Painel enxergue.
+
+O webhook (ou uma rota local do APP) chama agent-ia e grava resposta + eventual agendamento.
+
+4.4 Histórico
+
+Tabela com agendamentos do paciente e colunas: data/hora, status (compareceu/faltou/desmarcou/clínica).
+
+Status alimentado por campo status e/ou observacoes + ações pós-consulta.
+
+4.5 Botão “Voltar” em todas as telas
+
+<button onClick={()=>history.back()} ...>Voltar</button>
+
+5) Onde vejo o agendamento “aguardando confirmação” (itens 4/19)
+
+No Principal, em Agenda Day e Month/Week, exibir também os status='pendente' (cor cinza).
+
+No Dashboard, um card “Pendentes de Confirmação” (link para /agenda?mode=day&status=pendente).
+
+6) Painéis rápidos para “lenteza”
+
+Paginação em todas as listas.
+
+Índices (acima).
+
+AbortController 10s para fetch.
+
+SWR ou refresco manual (15s).
+
+Componentes pesados com lazy() + Suspense.
+
+Checklist de correção (bate-papo com seus itens)
+
+(1) Cards clicáveis ✅
+
+(2) Dashboard rápido: agregador + índices + paginação ✅
+
+(3) Tabs Mês/Dia/Semana plenas ✅
+
+(4)/(19) Agendamento do APP aparece no Principal (status pendente/confirmado + Realtime) ✅
+
+(5) Day view com botão “+” ✅
+
+(6) Fila DnD (arrastar) ✅
+
+(7) Remover funciona (DELETE) ✅
+
+(8) “Agendar” sugere 3 slots e confirma, removendo da fila ✅
+
+(9) Inclusão fila: cria paciente se necessário e obriga agendamento vinculado ✅
+
+(10) Pacientes CRUD + UX ✅
+
+(11) Painel mensagens com filtros e paginação ✅
+
+(12)/(21) Chat do APP aparece no Painel + sem looping (debounce + await) ✅
+
+(13) Feriados sem loop; sincroniza e destaca ✅
+
+(14) Recorrente anual ✅
+
+(15) Usuários sem loop ✅
+
+(16) Salvar usuário sem travar ✅
+
+(17) Menu superior moderno e responsivo ✅
+
+(18) APP colorido e moderno ✅
+
+(20) Só horários disponíveis no APP ✅
+
+(22) Histórico no APP ✅
+
+(23) Botão Voltar em todas as telas ✅

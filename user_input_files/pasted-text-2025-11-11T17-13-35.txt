@@ -1,0 +1,194 @@
+Aqui está a orientação técnica completa que você deve enviar ao Minimax para corrigir os loops de login, o travamento do App Paciente e o problema de exibição de horários. Está escrita de modo direto e pronto para execução pelos devs 👇
+
+🧩 ORIENTAÇÕES PARA CORRIGIR O LOGIN E LOOPINGS – SISTEMA PRINCIPAL E APP PACIENTE
+🎯 1. PROBLEMA: Looping infinito no login (Sistema Principal)
+
+Sintomas observados:
+
+Auth state changed: SIGNED_IN
+Auth loading timeout - forcing false
+Verificando sessão existente...
+Auth state changed: INITIAL_SESSION Sem sessão
+Login bem-sucedido detectado...
+Processando redirect...
+Processando redirect para usuário autenticado: false
+
+
+Causa:
+O hook de autenticação está sendo executado várias vezes e o router.replace() está disparando enquanto o estado loading ainda não terminou, o que causa o redirecionamento em loop.
+
+Correção obrigatória (no arquivo src/contexts/AuthContext.tsx):
+
+import { createContext, useContext, useEffect, useState } from 'react';
+import { supabase } from '@/lib/supabase';
+import { useRouter } from 'next/router';
+
+const AuthContext = createContext();
+
+export const AuthProvider = ({ children }) => {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const router = useRouter();
+
+  useEffect(() => {
+    let ativo = true;
+
+    async function carregarSessao() {
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!ativo) return;
+        setUser(session?.user || null);
+      } catch (e) {
+        console.error('Erro ao buscar sessão:', e);
+      } finally {
+        if (ativo) setLoading(false);
+      }
+    }
+
+    carregarSessao();
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user || null);
+      setLoading(false);
+    });
+
+    return () => {
+      ativo = false;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
+
+  // ✅ Evita o looping
+  useEffect(() => {
+    if (!loading) {
+      if (!user && router.pathname !== '/login') router.replace('/login');
+      if (user && router.pathname === '/login') router.replace('/dashboard');
+    }
+  }, [user, loading]);
+
+  return (
+    <AuthContext.Provider value={{ user, loading }}>
+      {!loading && children}
+    </AuthContext.Provider>
+  );
+};
+
+export const useAuth = () => useContext(AuthContext);
+
+
+🔹 Explicação:
+
+O carregamento (loading) é bloqueado até terminar a verificação da sessão.
+
+O redirecionamento só ocorre após loading === false.
+
+Isso elimina o loop detectado no debug.
+
+📱 2. PROBLEMA: Travamento no App Paciente (função Chat e Agendar)
+
+Sintomas observados:
+
+Chat não carrega (tela congelada).
+
+Na tela “Agendar”, após escolher a data, o sistema entra em looping “Disponibilizando horário…”.
+
+Causa:
+
+O App Paciente também está verificando sessão múltiplas vezes e bloqueia o estado de carregamento.
+
+A função de agendamento tenta buscar todos os horários, inclusive os ocupados, sem filtrar corretamente.
+
+✅ Correção – app-paciente/src/hooks/useAuth.tsx
+
+Use o mesmo modelo do AuthContext acima (simplificado):
+
+useEffect(() => {
+  let ativo = true;
+  async function carregar() {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (ativo) setUser(session?.user ?? null);
+    setLoading(false);
+  }
+  carregar();
+  const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
+    setUser(s?.user ?? null);
+    setLoading(false);
+  });
+  return () => { ativo = false; sub.subscription.unsubscribe(); };
+}, []);
+
+✅ Correção – função “Agendar” (src/pages/AgendamentosPage.tsx)
+
+Antes de listar horários, busque apenas os horários livres:
+
+const buscarHorariosDisponiveis = async (dataSelecionada) => {
+  const { data: ocupados } = await supabase
+    .from('agendamentos')
+    .select('inicio, fim')
+    .gte('inicio', `${dataSelecionada}T00:00:00`)
+    .lte('fim', `${dataSelecionada}T23:59:59`)
+    .in('status', ['pendente','confirmado']);
+
+  const horariosTodos = gerarIntervalos('08:00','18:00',30); // gera slots de 30 min
+  const horariosLivres = horariosTodos.filter(h =>
+    !ocupados?.some(o => o.inicio === h || o.fim === h)
+  );
+  setHorariosDisponiveis(horariosLivres);
+};
+
+
+🔹 Agora o paciente verá somente horários livres e o sistema não travará.
+
+🕓 3. PROBLEMA: Loop no menu Histórico (App Paciente)
+
+Sintoma: Tela fica carregando indefinidamente com logs repetidos de Auth state changed: INITIAL_SESSION.
+
+Causa: Mesmo problema — o componente tenta obter a sessão antes do contexto terminar o carregamento.
+
+Correção (em HistoricoPage.tsx):
+
+const { user, loading } = useAuth();
+
+if (loading) return <div>Carregando...</div>;
+if (!user) return <Navigate to="/login" />;
+
+useEffect(() => {
+  async function carregarHistorico() {
+    const { data, error } = await supabase
+      .from('agendamentos')
+      .select('*')
+      .eq('paciente_id', user.id)
+      .order('inicio', { ascending: false });
+    if (error) console.error(error);
+    setHistorico(data);
+  }
+  if (user) carregarHistorico();
+}, [user]);
+
+
+🔹 Isso garante que a função só execute após o login estar resolvido.
+
+🤖 4. Ajuste adicional – Erro favicon.ico
+
+Esse erro não quebra o sistema, mas gera ruído nos logs.
+
+Correção opcional:
+Adicionar no <head> do _app.tsx ou _document.tsx:
+
+<link rel="icon" href="/favicon.ico" />
+
+✅ Resumo das ações para o MiniMax executar
+
+Reescrever o AuthContext do sistema principal conforme o exemplo acima, garantindo que:
+
+A sessão é checada apenas uma vez.
+
+O redirecionamento só ocorre depois do loading=false.
+
+Aplicar a mesma lógica no App Paciente (useAuth).
+
+Na tela Agendar, exibir somente horários livres, removendo os ocupados.
+
+Na tela Histórico, aguardar loading=false antes de buscar dados.
+
+Remover warnings do favicon adicionando a tag <link rel="icon">.

@@ -1,0 +1,223 @@
+agora vamos orientar o MiniMax de forma completa e precisa, para que ele:
+✅ configure o OpenAI corretamente (com sua chave),
+✅ utilize uma Base Única de Conhecimento (BUC),
+✅ gere respostas inteligentes e coerentes no WhatsApp e no App Paciente,
+✅ e execute ações no sistema (agendar, cancelar, enviar exame, responder dúvidas).
+
+Abaixo segue o roteiro final pronto para o MiniMax, para colar e executar diretamente.
+
+🧠 ORIENTAÇÃO PARA O MINIMAX
+💬 INTEGRAÇÃO OPENAI + BASE DE CONHECIMENTO
+(WhatsApp + App Paciente + Sistema Principal)
+🎯 OBJETIVO GERAL
+
+Implementar um Agente de IA Clínico Inteligente, capaz de:
+
+Responder automaticamente às mensagens dos pacientes via WhatsApp (Avisa API) e Chat do App Paciente;
+
+Ler e utilizar a Base Única de Conhecimento (BUC) para elaborar respostas precisas e humanizadas;
+
+Reconhecer intenções (agendamento, cancelamento, exames, orientações médicas, dúvidas gerais);
+
+Executar ações automáticas no sistema (registrar agendamento, enviar exame ao painel, adicionar paciente à fila de espera);
+
+Atualizar registros no Supabase e registrar o histórico completo da conversa.
+
+⚙️ 1️⃣ CONFIGURAÇÃO DO OPENAI
+Variáveis obrigatórias no .env:
+OPENAI_API_KEY=chave_real_da_openai
+OPENAI_MODEL=gpt-4-turbo
+BASE_KNOWLEDGE_PATH=/knowledge/base_conhecimento.txt
+
+Biblioteca de conexão (src/lib/openai.ts):
+import OpenAI from "openai";
+import fs from "fs";
+
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY!,
+});
+
+export async function gerarRespostaIA(mensagem: string, contexto: string) {
+  try {
+    const prompt = `
+Você é um assistente médico digital da clínica MedIntelli. 
+Responda de forma educada, coerente e assertiva, usando linguagem natural e profissional.
+Use as informações da BASE DE CONHECIMENTO abaixo e oriente o paciente com clareza.
+
+--- BASE DE CONHECIMENTO ---
+${contexto}
+
+--- MENSAGEM DO PACIENTE ---
+${mensagem}
+
+Se identificar intenção de AGENDAMENTO, CANCELAMENTO ou EXAMES:
+- Retorne um JSON com a estrutura:
+{
+  "tipo": "agendamento|cancelamento|exame|informacao",
+  "mensagem": "resposta textual ao paciente",
+  "acao": {
+    "tabela": "agendamentos|fila_espera|exames",
+    "dados": {...}
+  }
+}
+Caso contrário, retorne apenas a resposta textual.
+    `;
+
+    const completion = await client.chat.completions.create({
+      model: process.env.OPENAI_MODEL || "gpt-4-turbo",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.4,
+    });
+
+    return completion.choices[0].message?.content;
+  } catch (error) {
+    console.error("Erro ao gerar resposta IA:", error);
+    return "Desculpe, estou com dificuldade para processar agora. Tente novamente em instantes.";
+  }
+}
+
+export async function carregarBaseConhecimento(): Promise<string> {
+  try {
+    const caminho = process.env.BASE_KNOWLEDGE_PATH || "./knowledge/base_conhecimento.txt";
+    return fs.existsSync(caminho) ? fs.readFileSync(caminho, "utf-8") : "";
+  } catch (error) {
+    console.error("Erro ao carregar base de conhecimento:", error);
+    return "";
+  }
+}
+
+📁 2️⃣ BASE ÚNICA DE CONHECIMENTO (BUC)
+
+Crie a pasta:
+
+/knowledge/base_conhecimento.txt
+
+
+E coloque o conteúdo inicial (exemplo):
+
+BASE DE CONHECIMENTO - CLÍNICA MEDINTELLI
+
+1. A clínica MedIntelli realiza atendimentos nas áreas de neurologia, psiquiatria e clínica geral.
+2. O horário de funcionamento é de segunda a sexta, das 8h às 18h.
+3. O paciente pode agendar, remarcar ou cancelar consultas pelo App Paciente ou WhatsApp.
+4. Em caso de emergência, o paciente deve procurar atendimento hospitalar imediato.
+5. O prazo médio para retorno de exame é de 3 dias úteis.
+6. A secretária Silvia pode confirmar horários e reagendar consultas.
+7. Pacientes novos precisam informar nome completo, telefone, e data de nascimento.
+8. A IA pode auxiliar no pré-agendamento, mas a confirmação final é feita pela equipe.
+
+
+O arquivo deve ser atualizado periodicamente pelo administrador ou médico, e a IA sempre usará o conteúdo mais recente.
+
+🔄 3️⃣ FUNÇÃO DE PROCESSAMENTO INTELIGENTE
+(Edge Function: /supabase/functions/agent-ia/index.ts)
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { gerarRespostaIA, carregarBaseConhecimento } from "./lib/openai.ts";
+
+Deno.serve(async (req) => {
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  );
+
+  try {
+    const { mensagem, paciente_id, origem } = await req.json();
+    if (!mensagem) throw new Error("Mensagem ausente.");
+
+    const contexto = await carregarBaseConhecimento();
+    const resposta = await gerarRespostaIA(mensagem, contexto);
+
+    // Grava resposta no histórico
+    await supabase.from("whatsapp_messages").insert({
+      paciente_id,
+      origem: origem || "app",
+      mensagem: resposta,
+      tipo: "resposta",
+      data_envio: new Date().toISOString(),
+    });
+
+    return new Response(JSON.stringify({ ok: true, resposta }), { status: 200 });
+  } catch (error) {
+    console.error("Erro no agente IA:", error);
+    return new Response(JSON.stringify({ ok: false, error: error.message }), { status: 400 });
+  }
+});
+
+📱 4️⃣ CHAT APP PACIENTE (Front)
+
+Ao enviar mensagem:
+
+async function handleEnviarMensagem() {
+  const body = {
+    mensagem: novaMensagem,
+    paciente_id: user.id,
+    origem: "app",
+  };
+
+  const res = await fetch("/api/agent-ia", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  const j = await res.json();
+  if (j.ok) {
+    setMensagens([...mensagens, { autor: "paciente", texto: novaMensagem }]);
+    setMensagens((prev) => [...prev, { autor: "ia", texto: j.resposta }]);
+    setNovaMensagem("");
+  } else {
+    alert("Erro: " + j.error);
+  }
+}
+
+💬 5️⃣ WHATSAPP (Avisa API + IA)
+
+No webhook whatsapp-webhook-receiver:
+
+// Após receber mensagem do paciente
+if (mensagem.tipo === "texto") {
+  const contexto = await carregarBaseConhecimento();
+  const resposta = await gerarRespostaIA(mensagem.texto, contexto);
+
+  // Enviar resposta via Avisa API
+  await fetch(`${Deno.env.get("AVISA_API_URL")}/messages/send`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${Deno.env.get("AVISA_API_KEY")}` },
+    body: JSON.stringify({
+      telefone: mensagem.telefone,
+      mensagem: resposta,
+    }),
+  });
+
+  // Registrar mensagem no banco
+  await supabase.from("whatsapp_messages").insert({
+    paciente_id: paciente.id,
+    origem: "whatsapp",
+    mensagem: resposta,
+    tipo: "resposta",
+  });
+}
+
+📊 6️⃣ DASHBOARD INTELIGENTE
+
+No Sistema Principal, incluir um Painel de Mensagens com IA:
+
+Exibir mensagens dos pacientes e respostas automáticas da IA;
+
+Botão “Revisar e reenviar resposta” (para humanos corrigirem respostas da IA, se necessário);
+
+Mostrar ícone 🧠 nas respostas automáticas;
+
+Indicar quando a IA executou uma ação automática (ex: criou agendamento).
+
+✅ RESULTADO FINAL
+
+Paciente envia mensagem → IA responde com empatia e informação real da BUC;
+
+IA pode agendar, cancelar, enviar exames ou orientar procedimentos;
+
+Todas as mensagens ficam registradas no painel do Sistema Principal;
+
+Equipe pode revisar e reenviar, mantendo histórico completo;
+
+Base de conhecimento centralizada e editável em um único arquivo.

@@ -1,0 +1,338 @@
+Segue o Patch Pack v3 (objetivo e direto) para o MiniMax aplicar no Sistema Principal (e pontos do App), cobrindo tudo o que você relatou agora: DnD na Fila (com modos de ordenação), correção de loops (Dashboard, Pacientes, Mensagens, Feriados), Agenda (exibir itens nas 3 visões + seletor de data + “cadastro rápido” de paciente ao agendar), favicon 404, e sincronização de feriados para aparecer também no App Paciente.
+
+Aplique na ordem: SQL → Edge Functions → API → Front (páginas).
+Ao final, reinicie o server.
+
+0) SQL — suporte a ordenação, feriados e performance
+-- FILA DE ESPERA: posição persistida para DnD
+alter table fila_espera add column if not exists pos int;
+
+-- índice para ordenação rápida
+create index if not exists idx_fila_espera_pos on fila_espera(pos);
+create index if not exists idx_fila_espera_created on fila_espera(created_at);
+
+-- FERIADOS: recorrente + mês/dia para destaque anual
+alter table feriados add column if not exists recorrente boolean default false;
+alter table feriados add column if not exists dia_mes int;
+alter table feriados add column if not exists mes int;
+update feriados
+  set dia_mes = extract(day from data), mes = extract(month from data)
+where dia_mes is null or mes is null;
+
+-- AGENDAMENTOS: índices
+create index if not exists idx_agendamentos_inicio on agendamentos(inicio);
+create index if not exists idx_agendamentos_status on agendamentos(status);
+
+-- RPC slots livres (se ainda não existir)
+create or replace function public.horarios_livres(_dia date)
+returns table(inicio timestamptz, fim timestamptz)
+language plpgsql stable as $$
+declare
+  cursor_time timestamptz := (_dia::timestamptz + time '08:00');
+  end_time   timestamptz := (_dia::timestamptz + time '18:00');
+  overl bigint;
+begin
+  while cursor_time < end_time loop
+    select count(1) into overl
+    from agendamentos a
+    where a.status <> 'cancelado'
+      and a.inicio < cursor_time + interval '30 min'
+      and a.fim    > cursor_time;
+    if overl = 0 then
+      inicio := cursor_time; fim := cursor_time + interval '30 min';
+      return next;
+    end if;
+    cursor_time := cursor_time + interval '30 min';
+  end loop;
+end; $$;
+
+1) Edge Functions — Fila DnD + ordenação; Feriados sincronizar
+1.1 /supabase/functions/fila-espera/index.ts (DnD + modos de ordenação)
+
+Adicione os métodos abaixo (reordenar e listar por modo):
+
+if (req.method === 'PATCH') {
+  // Persistir nova ordem: { ordenacao: [{id, pos}, ...] }
+  const { ordenacao } = await req.json();
+  if (!Array.isArray(ordenacao)) return new Response('Payload inválido', { status:400 });
+  for (const o of ordenacao) {
+    await supabase.from('fila_espera').update({ pos: o.pos }).eq('id', o.id);
+  }
+  return new Response(JSON.stringify({ ok:true }), { status:200 });
+}
+
+if (req.method === 'GET') {
+  const url = new URL(req.url);
+  const modo = url.searchParams.get('modo') || 'chegada'; // 'chegada' | 'prioridade'
+  let query = supabase.from('fila_espera').select('*, paciente:pacientes(id,nome,telefone), agendamento:agendamentos(id,inicio,status)');
+  if (modo === 'chegada') query = query.order('created_at', { ascending: true });
+  if (modo === 'prioridade') query = query.order('prioridade', { ascending: false }).order('created_at', { ascending: true });
+  const { data, error } = await query;
+  if (error) return new Response(JSON.stringify({ error:error.message }), { status:400 });
+  return new Response(JSON.stringify({ ok:true, data }), { status:200 });
+}
+
+
+Observação: se você quiser prioridade numérica, normalize no front (ex.: urgente=3, alta=2, média=1, baixa=0) ou salve assim na tabela.
+
+1.2 /supabase/functions/feriados-sync/index.ts (upsert + recorrente)
+
+Garanta que o “Sincronizar Automático” grava e calcula dia_mes/mes. Depois o front destaca na agenda.
+
+if (req.method === 'POST') {
+  const { feriados } = await req.json(); // [{ data:'YYYY-MM-DD', titulo, escopo, recorrente, uf, municipio }]
+  for (const f of (feriados||[])) {
+    const data = f.data;
+    const dia_mes = Number(data.slice(8,10));
+    const mes     = Number(data.slice(5,7));
+    const { error } = await supabase.from('feriados').upsert({
+      data, titulo: f.titulo, escopo: f.escopo || 'nacional',
+      uf: f.uf || null, municipio: f.municipio || null,
+      recorrente: !!f.recorrente, dia_mes, mes
+    }, { onConflict: 'data' });
+    if (error) return new Response(JSON.stringify({ error: error.message }), { status:400 });
+  }
+  return new Response(JSON.stringify({ ok:true }), { status:200 });
+}
+
+2) API — proxies que faltavam (Next.js)
+2.1 /src/pages/api/fila-espera.ts
+
+Encaminhe GET (com modo), PATCH (reordenar), POST/PUT/DELETE conforme já tem:
+
+export default async function handler(req,res){
+  const url = `${process.env.SUPABASE_URL}/functions/v1/fila-espera`;
+  const opts:any = { method: req.method, headers:{'Content-Type':'application/json'} };
+  if (req.method === 'GET') {
+    const modo = req.query.modo || 'chegada';
+    const r = await fetch(`${url}?modo=${modo}`);
+    return res.status(r.status).json(await r.json());
+  }
+  if (['POST','PUT','PATCH'].includes(req.method)) opts.body = JSON.stringify(req.body);
+  if (req.method === 'DELETE') return res.status(405).end();
+  const r = await fetch(url, opts);
+  return res.status(r.status).json(await r.json());
+}
+
+2.2 /src/pages/api/feriados.ts
+
+Encaminhar POST do “Sincronizar Automático”.
+
+3) Front — Sistema Principal
+3.1 Corrigir looping no Dashboard + favicon 404
+
+Favicon: crie public/favicon.ico (qualquer ícone 32x32), ou remova <link rel="icon" ...> quebrado.
+
+Auth loop: no layout protegido, redirecione somente após loading:
+
+const { user, loading } = useAuth(); // seu hook
+useEffect(()=>{
+  if (!loading && !user) router.replace('/login');
+},[loading, user]);
+
+
+Troque efeitos “Buscando perfil …” que rodam sem dependências corretas. Sempre use [] ou dependências estáveis.
+
+3.2 Fila de Espera — arrastar para ordenar + modos de ordenação
+
+Arquivo: src/pages/fila-espera/index.tsx
+
+Adicione um select “Ordenar por”: chegada | prioridade.
+
+HTML5 DnD para reordenar e persistir:
+
+const [modo, setModo] = useState<'chegada'|'prioridade'>('chegada');
+const [items, setItems] = useState<any[]>([]);
+const [dragId, setDragId] = useState<string|null>(null);
+
+async function load(){ 
+  const r = await fetch(`/api/fila-espera?modo=${modo}`);
+  const j = await r.json(); setItems(j.data||[]);
+}
+
+useEffect(()=>{ load(); },[modo]);
+
+function onDragStart(id:string){ setDragId(id); }
+async function onDrop(targetId:string){
+  if (!dragId || dragId===targetId) return;
+  const sourceIdx = items.findIndex(i=>i.id===dragId);
+  const targetIdx = items.findIndex(i=>i.id===targetId);
+  const reordered = [...items];
+  const [moved] = reordered.splice(sourceIdx,1);
+  reordered.splice(targetIdx,0,moved);
+  // persistir
+  const ordenacao = reordered.map((it, idx)=>({ id: it.id, pos: idx }));
+  await fetch('/api/fila-espera',{ method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ ordenacao })});
+  await load();
+  setDragId(null);
+}
+
+
+No item:
+
+<li key={it.id}
+  draggable
+  onDragStart={()=>onDragStart(it.id)}
+  onDragOver={(e)=>e.preventDefault()}
+  onDrop={()=>onDrop(it.id)}
+  className="border p-2 rounded hover:bg-gray-50">
+  {/* conteúdo do item */}
+</li>
+
+
+Form de inclusão (erro de “não cadastrado”)
+No modal Novo na fila: permita digitar nome/telefone ou escolher paciente existente. Se não existir, crie paciente rápido e depois insira na fila.
+
+async function addFila({ nome, telefone, paciente_id, motivo, prioridade }){
+  let pid = paciente_id;
+  if (!pid) {
+    // cadastro rápido
+    const r = await fetch('/api/pacientes',{ method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ nome, telefone, ativo:true })});
+    const j = await r.json(); pid = j?.data?.id || j?.id;
+  }
+  const r2 = await fetch('/api/fila-espera', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ paciente_id: pid, motivo, prioridade })});
+  if (!r2.ok) return alert('Erro ao adicionar à fila de espera');
+  await load();
+}
+
+
+Regra: para ficar na fila, deve haver um agendamento vinculado. Se a Edge POST da fila ainda não cria automático, faça checagem e crie um “pendente” no próximo slot livre.
+
+3.3 Agenda — exibir nas 3 visões + seletor de data + cadastro rápido
+
+Seletor de data simples na barra da agenda:
+
+<input type="date" value={date} onChange={e=>setDate(e.target.value)} className="border p-2 rounded" />
+
+
+Monthly/Weekly/Day: garanta que o fetch usa janelas corretas de tempo:
+
+Mês: primeiro dia 00:00 até último dia 23:59:59.
+
+Semana: segunda 00:00 até domingo 23:59:59.
+
+Dia: GET /api/agendamentos?dia=YYYY-MM-DD (sua Edge já faz).
+
+Cadastro rápido (ao criar manualmente e o paciente não existir):
+
+Modal com “CPF/Telefone/E-mail/Nome”.
+
+Botão “Criar e Agendar”.
+
+Fluxo: cria paciente → POST /api/agendamentos.
+
+Render não aparece: assegure que você inclui status ‘pendente’ na listagem, não só ‘confirmado’.
+
+3.4 Pacientes — salvar sem loop
+
+Em src/pages/pacientes/index.tsx:
+
+Efeito de carregamento sem dependência circular:
+
+useEffect(()=>{ load(); },[]); // NÃO coloque 'list' ou 'form' como dependência
+
+
+Em onSave, use try/finally para sempre dar setSaving(false):
+
+setSaving(true);
+try {
+  // POST/PUT
+} finally {
+  setSaving(false);
+}
+
+3.5 App Paciente (mensagens no painel) — sem looping e vazio amigável
+
+Em src/pages/pacientes/painel.tsx ou src/pages/mensagens/index.tsx:
+
+const [loading, setLoading] = useState(true);
+const [mensagens, setMensagens] = useState<any[]>([]);
+
+useEffect(()=>{
+  let alive = true;
+  const ctrl = new AbortController();
+  async function load(){
+    setLoading(true);
+    try {
+      const r = await fetch('/api/painel-paciente', { signal: ctrl.signal });
+      const j = await r.json();
+      if (!alive) return;
+      setMensagens(j.data || []);
+    } catch (e) {
+      if (!alive) return;
+      console.warn('Falha ao carregar mensagens', e);
+    } finally {
+      if (alive) setLoading(false);
+    }
+  }
+  load();
+  const id = setInterval(load, 15000);
+  return ()=>{ alive=false; ctrl.abort(); clearInterval(id); };
+},[]);
+
+return (
+  <div className="p-4">
+    {loading ? <div>Carregando mensagens...</div> :
+      mensagens.length === 0 ? <div className="text-gray-400">Nenhuma mensagem encontrada</div> :
+      mensagens.map(m => /* render */ null)
+    }
+  </div>
+);
+
+3.6 Feriados — tela sem loop + destacar na agenda (Principal e App)
+
+Na página Feriados, evite dependências incorretas no useEffect e use try/finally.
+
+Depois do Sincronizar Automático, reload da lista e exiba um toast.
+
+Na Agenda (Month/Week/Day), carregue feriados do período e pinte o dia (ex.: uma badge “Feriado” ou um dot corado).
+Para recorrentes, compare mes/dia_mes com a data renderizada.
+
+Exemplo (mês):
+
+const feriadosDoMes = feriados.filter(f => 
+  (f.recorrente && f.mes===mes && f.dia_mes===dia) ||
+  (!f.recorrente && sameDate(f.data, dateCell))
+);
+
+4) App Paciente — refletir feriados também
+
+Na agenda do App, reutilize a mesma API de feriados (ou supabase from('feriados')) para destacar os dias não agendáveis e informar o paciente.
+
+5) Favicon 404
+
+Coloque um arquivo em public/favicon.ico.
+Se usa <Head>, garanta:
+
+<link rel="icon" href="/favicon.ico" />
+
+6) Agenda não exibe itens (mensal/diária/semanal)
+
+Checklist rápido:
+
+Timezone: use toISOString() nas chamadas; converta para local no render.
+
+Consulta inclui pendentes:
+
+.in('status', ['pendente','confirmado'])
+
+
+Janela correta de datas por modo (mês/semana/dia).
+
+Recarregar após criar/agendar.
+
+✅ Resultado esperado
+
+Fila de Espera: arrastar ↑↓ com persistência; alternar modo de ordenação (chegada | prioridade+chegada).
+
+Dashboard: sem loop; favicon ok.
+
+Agenda: aparece nas 3 visões; seletor de dia; “cadastro rápido” de paciente ao agendar.
+
+Pacientes: cadastro salva sem loop.
+
+Painel de Mensagens (App/WhatsApp): sem looping; mostra “Nenhuma mensagem encontrada” quando vazio.
+
+Feriados: tela carrega; “Sincronizar Automático” grava; feriados destacados no Principal e no App.
